@@ -1,0 +1,24 @@
+# Build folders
+build/
+*.o
+*.obj
+*.exe
+*.dll
+
+# Qt / CMake
+CMakeFiles/
+CMakeCache.txt
+*.cmake
+Makefile
+
+# Qt Creator
+*.user
+*.autosave
+
+# Ninja
+.ninja_log
+.ninja_deps
+
+# Generated files
+*.json.gen
+*.qmltypes
