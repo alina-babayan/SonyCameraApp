@@ -16,9 +16,12 @@ Perform basic image viewing operations (zoom, rotate, compare, histogram)
 
 The application integrates the Sony Camera Remote SDK (SCRSDK) for hardware communication.
 
+
+
 2. 🏗️ Architecture
 
 The system follows a hybrid architecture:
+
 
 Backend (C++)
 Handles camera communication via Sony SDK
@@ -61,7 +64,9 @@ User controls (buttons, sliders)
 Histogram & comparison tools
 Logging system
 4. 🔌 Camera Lifecycle
+
 4.1 Initialization
+
 SCRSDK::Init();
 Initializes Sony SDK
 Must be called before any camera operation
