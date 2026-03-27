@@ -1,218 +1,103 @@
-📷 Sony Camera Control & Photo Editor
+Ответ Gemini
+SonyCamera Class Documentation
+The SonyCamera class serves as a high-level C++/Qt wrapper for the Sony Camera Remote SDK. It manages device discovery, connection lifecycle, live view streaming, and hardware property manipulation (ISO, Shutter Speed, Focus, etc.).
 
-(Qt + Sony SDK Project Documentation)
+1. Core Lifecycle Management
+bool initialize()
+Initializes the Sony SDK environment. This must be called (or is called automatically by connectCamera) before any SDK functions are used.
 
-1. 📌 Overview
+Returns: true if the SDK is ready or already initialized.
 
-This project is a desktop application built with Qt (C++ + QML) that allows users to:
+bool connectCamera()
+Executes an asynchronous camera discovery and connection routine.
 
-Connect to a Sony camera via USB
-Capture photos remotely
-View live camera feed (Live View)
-Adjust camera settings (ISO, shutter, exposure, etc.)
-Display EXIF metadata
-View and manage captured images
-Perform basic image viewing operations (zoom, rotate, compare, histogram)
+Process: 1. Enumerates available cameras via USB.
+2. Connects to the first detected device in Remote control mode.
+3. Offloads connection logic to QThreadPool to prevent UI freezing.
 
-The application integrates the Sony Camera Remote SDK (SCRSDK) for hardware communication.
+Signals: Emits connectionChanged(true) on success via the OnConnected callback.
 
+void disconnectCamera() / shutdown()
+Safely terminates the live view, disconnects the hardware handle, and releases SDK resources.
 
+2. Live View Operations
+void startLiveView() / stopLiveView()
+Controls the retrieval of the real-time preview stream.
 
-2. 🏗️ Architecture
+Mechanism: Uses a QTimer (33ms interval / ~30 FPS) to trigger pollLiveViewFrame.
 
-The system follows a hybrid architecture:
+void pollLiveViewFrame()
+The internal heartbeat of the live view system.
 
+Requests image metadata from the camera.
 
-Backend (C++)
-Handles camera communication via Sony SDK
-Processes image data
-Manages device properties and EXIF info
-Emits signals to UI
-Frontend (QML)
-Provides graphical interface
-Displays images and live feed
-Handles user interactions
-User (QML UI)
-      ↓
-SonyCamera (C++ Controller)
-      ↓
-Sony SDK (SCRSDK)
-      ↓
-Sony Camera Device
-3. ⚙️ Core Components
-3.1 📦 SonyCamera Class (Backend)
+Allocates a buffer and fetches the JPEG payload.
 
-Defined in:
+Converts the raw bytes into a QImage.
 
+Signal: Emits liveViewFrameReady(QImage) for display in QML/UI.
 
-Responsibilities:
-SDK initialization & shutdown
-Camera connection management
-Live view streaming
-Photo capture
-Camera settings control
-EXIF metadata retrieval
-3.2 🎨 QML UI (Frontend)
+3. Property & Setting Management
+void fetchAllSettings()
+A batch operation that retrieves current values and available options for:
 
-Defined in:
+ISO Sensitivity
 
+Shutter Speed
 
-Responsibilities:
-User interface layout
-Display images & live feed
-User controls (buttons, sliders)
-Histogram & comparison tools
-Logging system
-4. 🔌 Camera Lifecycle
+Exposure Bias
 
-4.1 Initialization
+Sharpness & Monitor Brightness
 
-SCRSDK::Init();
-Initializes Sony SDK
-Must be called before any camera operation
-4.2 Connection Flow
-Enumerate devices
-Select first camera
-Connect using SDK
-SCRSDK::EnumCameraObjects(...)
-SCRSDK::Connect(...)
-4.3 Disconnection
-SCRSDK::Disconnect(...)
-SCRSDK::ReleaseDevice(...)
-4.4 Shutdown
-SCRSDK::Release();
-5. 📸 Features
-5.1 Photo Capture
-Triggered via:
-SCRSDK::SendCommand(... CrCommandId_Release ...)
-Automatically saves images to:
-Pictures/SonyCaptures
-5.2 Live View
-Uses timer (~30 FPS):
-m_lvTimer->setInterval(33);
-Fetches JPEG frames:
-SCRSDK::GetLiveViewImage(...)
-Emits frames to UI:
-emit liveViewFrameReady(frame);
-5.3 Camera Settings Control
+void setProperty(SCRSDK::CrDevicePropertyCode code, quint64 value)
+The primary internal method for modifying hardware settings. It maps the property code to the correct CrDataType (e.g., Int16 for brightness, UInt32 for ISO) before sending the command to the camera.
 
-Supported settings:
+void fetchExifInfo()
+Queries the camera for read-only metadata and current state:
 
-Setting	Function
-ISO	setISO()
-Shutter Speed	setShutterSpeed()
-Exposure	setExposure()
-Sharpness	setSharpness()
-Brightness	setBrightness()
+Hardware: Model Name, Lens Model, Battery Level.
 
-Generic handler:
+Shooting State: Exposure Mode (P/A/S/M), White Balance, Focal Distance, and Aperture.
 
-setProperty(code, value);
-5.4 Manual Focus Control
-Retrieves focus range
-Allows slider-based adjustment
-setFocusPosition(value);
-5.5 EXIF Metadata
+Signal: Emits exifReady() once the internal strings are populated.
 
-Fetched using:
+4. Focus Control
+void fetchFocusRange()
+Retrieves the physical focus limits of the attached lens. It populates m_focusMin and m_focusMax to ensure subsequent focus commands stay within valid hardware boundaries.
 
-fetchExifInfo();
+void setFocusPosition(quint32 value)
+Sets the lens focus to a specific value.
 
-Includes:
+Safety: Automatically clamps the input value to the range discovered by fetchFocusRange.
 
-Camera model
-Lens
-Aperture
-ISO
-Shutter speed
-White balance
-Battery level
-5.6 Image Viewer Features
+5. Capture & Storage
+void takePhoto()
+Triggers the shutter.
 
-From QML:
+Behavior: Briefly pauses the Live View timer during the capture command to prioritize processing power and bandwidth for the image acquisition, then resumes automatically after 800ms.
 
-Zoom (mouse wheel / pinch)
-Pan (drag)
-Rotate
-Fullscreen mode
-Image comparison (before/after slider)
-Histogram display
-6. 🖥️ User Interface
-Main Sections
-🔹 Top Bar
-Connection status indicator
-Connect / Disconnect buttons
-Error display
-🔹 Left Panel
-Open image
-Take photo
-Start/Stop live view
-Rotate / fullscreen
-🔹 Center Canvas
-Image display
-Live view stream
-Compare mode
-Histogram overlay
-🔹 Right Panel
-Camera settings controls
-ISO, shutter, exposure, etc.
-Manual focus slider
-🔹 Bottom Panel
-Toolbar (zoom, histogram, compare)
-Image gallery (film strip)
-🔹 Log Panel
-Displays real-time logs:
-Connection events
-Errors
-Actions
-7. 🔄 Signals & Events
-Backend → UI
-liveViewFrameReady(frame)
-photoTaken(filePath)
-settingsChanged()
-exifReady()
-errorOccurred(message)
-logMessage(message)
-UI → Backend
-connectCamera()
-disconnectCamera()
-takePhoto()
-startLiveView()
-setISO(value) etc.
-8. 🧵 Multithreading
-Uses QThreadPool for:
-Camera connection
-Photo capture
+void setupSaveInfo()
+Configures the local file system path where the camera will transfer images.
 
-This prevents UI blocking.
+Default Path: Pictures/SonyCaptures.
 
-9. 📁 File Storage
+Mode: Uses CrSETSAVEINFO_AUTO_NUMBER to prevent file overwriting.
 
-Images saved to:
+6. Callback Handling (SDK Implementation)
+The class implements the Sony SDK IDeviceCallback interface to handle asynchronous events:
 
-~/Pictures/SonyCaptures
+OnConnected / OnDisconnected: Updates connection state.
 
-Auto-created if not existing.
+OnPropertyChanged: Triggers a re-fetch of settings if a change is made physically on the camera.
 
-10. ⚠️ Error Handling
-SDK failures emit:
-errorOccurred("message")
-UI displays errors with timeout (5 seconds)
-11. 🚀 Key Advantages
-Real-time live view streaming
-Full camera control via SDK
-Modern responsive UI (QML)
-Non-blocking multithreaded design
-Advanced viewer tools (histogram, compare)
-12. 🧩 Possible Improvements
-RAW image support
-Image editing tools (filters, crop)
-Multi-camera support
-Video recording
-Cloud sync
-13. 📚 Technologies Used
-C++ (Qt Framework)
-QML (Qt Quick UI)
-Sony Camera Remote SDK (SCRSDK)
-Qt Threading (QThreadPool)
-Qt Multimedia / Image Handling
+OnCompleteDownload: Called when a high-resolution image finishes transferring to the PC. Emits photoTaken(path).
+
+OnError: Routes hardware or protocol errors to the errorOccurred(QString) signal.
+
+Signal Summary
+Signal	Description
+connectionChanged(bool)	Emitted when the camera connects or disconnects.
+liveViewFrameReady(QImage)	Provides a new frame for the UI viewfinder.
+settingsChanged()	Notifies that ISO, Shutter, or other properties were updated.
+photoTaken(QString)	Provides the local file path of a newly captured image.
+errorOccurred(QString)	Provides user-friendly error messages for UI alerts.
