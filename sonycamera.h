@@ -20,12 +20,16 @@ class SonyCamera : public QObject, public SCRSDK::IDeviceCallback
     Q_PROPERTY(QVariantList exposureValues READ exposureValues NOTIFY settingsChanged)
     Q_PROPERTY(QVariantList sharpnessValues READ sharpnessValues NOTIFY settingsChanged)
     Q_PROPERTY(QVariantList brightnessValues READ brightnessValues NOTIFY settingsChanged)
+    Q_PROPERTY(QVariantList imageSizeValues  READ imageSizeValues  NOTIFY settingsChanged)
+    Q_PROPERTY(QVariantList imageQualValues  READ imageQualValues  NOTIFY settingsChanged)
 
     Q_PROPERTY(quint64 currentISO       READ currentISO       NOTIFY settingsChanged)
     Q_PROPERTY(quint64 currentShutter   READ currentShutter   NOTIFY settingsChanged)
     Q_PROPERTY(quint64 currentExposure  READ currentExposure  NOTIFY settingsChanged)
     Q_PROPERTY(quint64 currentSharpness READ currentSharpness NOTIFY settingsChanged)
     Q_PROPERTY(quint64 currentBrightness READ currentBrightness NOTIFY settingsChanged)
+    Q_PROPERTY(quint64 currentImageSize  READ currentImageSize  NOTIFY settingsChanged)
+    Q_PROPERTY(quint64 currentImageQual  READ currentImageQual  NOTIFY settingsChanged)
 
     Q_PROPERTY(quint32 focusPosition    READ focusPosition    NOTIFY focusPositionChanged)
     Q_PROPERTY(quint32 focusMin         READ focusMin         NOTIFY focusRangeReady)
@@ -44,12 +48,16 @@ public:
     QVariantList exposureValues()  const { return m_exposureValues; }
     QVariantList sharpnessValues() const { return m_sharpnessValues; }
     QVariantList brightnessValues()const { return m_brightnessValues; }
+    QVariantList imageSizeValues() const { return m_imageSizeValues; }
+    QVariantList imageQualValues() const { return m_imageQualValues; }
 
     quint64 currentISO()       const { return m_currentISO; }
     quint64 currentShutter()   const { return m_currentShutter; }
     quint64 currentExposure()  const { return m_currentExposure; }
     quint64 currentSharpness() const { return m_currentSharpness; }
     quint64 currentBrightness()const { return m_currentBrightness; }
+    quint64 currentImageSize() const { return m_currentImageSize; }
+    quint64 currentImageQual() const { return m_currentImageQual; }
 
     quint32 focusPosition()   const { return m_focusPosition; }
     quint32 focusMin()        const { return m_focusMin; }
@@ -76,11 +84,15 @@ public:
     Q_INVOKABLE void setSharpness(quint64 value);
     Q_INVOKABLE void setBrightness(quint64 value);
     Q_INVOKABLE void setWhiteBalance(quint32 value);
+    Q_INVOKABLE void setImageSize(quint64 value);
+    Q_INVOKABLE void setImageQual(quint64 value);
 
     Q_INVOKABLE QString formatISO(quint64 raw) const;
     Q_INVOKABLE QString formatShutter(quint64 raw) const;
     Q_INVOKABLE QString formatExposure(quint64 raw) const;
     Q_INVOKABLE QString formatBrightness(quint64 raw) const;
+    Q_INVOKABLE QString formatImageSize(quint64 raw) const;
+    Q_INVOKABLE QString formatImageQual(quint64 raw) const;
 
     Q_INVOKABLE void    fetchExifInfo();
     Q_INVOKABLE QString exifModel()        const { return m_exifModel; }
@@ -103,6 +115,10 @@ signals:
 
     void liveViewActiveChanged(bool active);
     void liveViewFrameReady(const QImage& frame);
+
+    // Fired with the post-view JPEG decoded in memory — arrives before the file
+    // is written to disk, so the UI can show the shot with zero disk round-trip.
+    void postViewFrameReady(const QImage& frame);
 
     void focusPositionChanged(quint32 position);
     void focusRangeReady();
@@ -134,6 +150,7 @@ private:
     std::wstring m_savePathW;
 
     QTimer* m_lvTimer = nullptr;
+    bool    m_capturePending = false;  // true between shutter and post-view frame
 
     quint32 m_focusPosition  = 0;
     quint32 m_focusMin       = 0;
@@ -146,12 +163,16 @@ private:
     QVariantList m_exposureValues;
     QVariantList m_sharpnessValues;
     QVariantList m_brightnessValues;
+    QVariantList m_imageSizeValues;
+    QVariantList m_imageQualValues;
 
     quint64 m_currentISO        = 0;
     quint64 m_currentShutter    = 0;
     quint64 m_currentExposure   = 0;
     quint64 m_currentSharpness  = 0;
     quint64 m_currentBrightness = 0;
+    quint64 m_currentImageSize  = 0;
+    quint64 m_currentImageQual  = 0;
 
     QString m_exifModel;
     QString m_exifLens;

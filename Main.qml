@@ -676,6 +676,26 @@ ApplicationWindow {
                                 onValueSelected: function(v) { sonyCamera.setBrightness(v) }
                             }
 
+                            SettingRow {
+                                label: "Img Size"
+                                currentText: sonyCamera.connected ? sonyCamera.formatImageSize(sonyCamera.currentImageSize) : "—"
+                                model: sonyCamera.imageSizeValues
+                                currentValue: sonyCamera.currentImageSize
+                                enabled: sonyCamera.connected && sonyCamera.imageSizeValues.length > 0
+                                formatFn: function(v) { return sonyCamera.formatImageSize(v) }
+                                onValueSelected: function(v) { sonyCamera.setImageSize(v) }
+                            }
+
+                            SettingRow {
+                                label: "Img Qual"
+                                currentText: sonyCamera.connected ? sonyCamera.formatImageQual(sonyCamera.currentImageQual) : "—"
+                                model: sonyCamera.imageQualValues
+                                currentValue: sonyCamera.currentImageQual
+                                enabled: sonyCamera.connected && sonyCamera.imageQualValues.length > 0
+                                formatFn: function(v) { return sonyCamera.formatImageQual(v) }
+                                onValueSelected: function(v) { sonyCamera.setImageQual(v) }
+                            }
+
                             Rectangle {
                                 id: wbPanel
                                 width: 220
@@ -1307,13 +1327,13 @@ ApplicationWindow {
 
             delegate: Rectangle {
                 width: dropList.width; height: 32
-                color: (modelData !== "__empty__" && modelData === settingRow.currentValue) ? "#2A3A5A"
+                color: (modelData !== "__empty__" && modelData == settingRow.currentValue) ? "#2A3A5A"
                      : dropMouse.containsMouse ? "#222233" : "#181818"
 
                 Text {
                     anchors.verticalCenter: parent.verticalCenter; leftPadding: 16
                     text: modelData === "__empty__" ? "Not available in this mode" : settingRow.formatFn(modelData)
-                    color: modelData === "__empty__" ? "#555555" : (modelData === settingRow.currentValue ? "#88BBFF" : "#AAAAAA")
+                    color: modelData === "__empty__" ? "#555555" : (modelData == settingRow.currentValue ? "#88BBFF" : "#AAAAAA")
                     font.pixelSize: 11; font.italic: modelData === "__empty__"
                 }
                 Rectangle { width: parent.width; height: 1; color: "#1E1E1E"; anchors.bottom: parent.bottom }
