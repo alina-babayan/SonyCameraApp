@@ -120,21 +120,34 @@ ApplicationWindow {
     property var histB: []
 
     function computeHistogram(imgObj) {
-        histCanvas.imgSource = imgObj.source
-        histCanvas.requestPaint()
+        if (histSrcImage.source === imgObj.source) {
+            histCanvas.requestPaint()
+        } else {
+            histSrcImage.source = imgObj.source
+        }
+    }
+
+    Image {
+        id: histSrcImage
+        width: 256; height: 256
+        visible: false; cache: false
+        fillMode: Image.Stretch
+        onStatusChanged: {
+            if (status === Image.Ready)
+                histCanvas.requestPaint()
+        }
     }
 
     Canvas {
         id: histCanvas
         width: 256; height: 256
         visible: false
-        property url imgSource: ""
 
         onPaint: {
-            if (imgSource === "") return
+            if (histSrcImage.status !== Image.Ready) return
             var ctx = getContext("2d")
             ctx.clearRect(0, 0, width, height)
-            ctx.drawImage(imgSource.toString(), 0, 0, 256, 256)
+            ctx.drawImage(histSrcImage, 0, 0, 256, 256)
             var data = ctx.getImageData(0, 0, 256, 256).data
             var r = new Array(256).fill(0)
             var g = new Array(256).fill(0)
@@ -192,9 +205,9 @@ ApplicationWindow {
                 }
 
                 Button {
-                    id: connectBtn; text: "Connect"
-                    implicitWidth: 90; implicitHeight: 26
-                    enabled: !sonyCamera.connected; opacity: enabled ? 1.0 : 0.35
+                    id: connectBtn; text: sonyCamera.connecting ? "Connecting..." : "Connect"
+                    enabled: !sonyCamera.connected && !sonyCamera.connecting
+                    opacity: enabled ? 1.0 : 0.35
                     background: Rectangle { radius: 4; color: connectBtn.pressed ? "#1a7a1a" : "#226622" }
                     contentItem: Text { text: connectBtn.text; color: "white"; font.pixelSize: 12; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
                     onClicked: { log("Connecting to camera..."); sonyCamera.connectCamera() }
@@ -631,7 +644,7 @@ ApplicationWindow {
                                 currentText: sonyCamera.connected ? sonyCamera.formatISO(sonyCamera.currentISO) : "—"
                                 model: sonyCamera.isoValues
                                 currentValue: sonyCamera.currentISO
-                                enabled: sonyCamera.connected && sonyCamera.isoValues.length > 0
+                                enabled_: sonyCamera.connected && sonyCamera.isoValues.length > 0
                                 formatFn: function(v) { return sonyCamera.formatISO(v) }
                                 onValueSelected: function(v) { sonyCamera.setISO(v) }
                             }
@@ -641,7 +654,7 @@ ApplicationWindow {
                                 currentText: sonyCamera.connected ? sonyCamera.formatShutter(sonyCamera.currentShutter) : "—"
                                 model: sonyCamera.shutterValues
                                 currentValue: sonyCamera.currentShutter
-                                enabled: sonyCamera.connected && sonyCamera.shutterValues.length > 0
+                                enabled_: sonyCamera.connected && sonyCamera.shutterValues.length > 0
                                 formatFn: function(v) { return sonyCamera.formatShutter(v) }
                                 onValueSelected: function(v) { sonyCamera.setShutterSpeed(v) }
                             }
@@ -651,7 +664,7 @@ ApplicationWindow {
                                 currentText: sonyCamera.connected ? sonyCamera.formatExposure(sonyCamera.currentExposure) : "—"
                                 model: sonyCamera.exposureValues
                                 currentValue: sonyCamera.currentExposure
-                                enabled: sonyCamera.connected
+                                enabled_: sonyCamera.connected
                                 formatFn: function(v) { return sonyCamera.formatExposure(v) }
                                 onValueSelected: function(v) { sonyCamera.setExposure(v) }
                             }
@@ -661,7 +674,7 @@ ApplicationWindow {
                                 currentText: sonyCamera.connected ? String(sonyCamera.currentSharpness) : "—"
                                 model: sonyCamera.sharpnessValues
                                 currentValue: sonyCamera.currentSharpness
-                                enabled: sonyCamera.connected
+                                enabled_: sonyCamera.connected
                                 formatFn: function(v) { return String(v) }
                                 onValueSelected: function(v) { sonyCamera.setSharpness(v) }
                             }
@@ -671,7 +684,7 @@ ApplicationWindow {
                                 currentText: sonyCamera.connected ? sonyCamera.formatBrightness(sonyCamera.currentBrightness) : "—"
                                 model: sonyCamera.brightnessValues
                                 currentValue: sonyCamera.currentBrightness
-                                enabled: sonyCamera.connected
+                                enabled_: sonyCamera.connected
                                 formatFn: function(v) { return sonyCamera.formatBrightness(v) }
                                 onValueSelected: function(v) { sonyCamera.setBrightness(v) }
                             }
@@ -681,7 +694,7 @@ ApplicationWindow {
                                 currentText: sonyCamera.connected ? sonyCamera.formatImageSize(sonyCamera.currentImageSize) : "—"
                                 model: sonyCamera.imageSizeValues
                                 currentValue: sonyCamera.currentImageSize
-                                enabled: sonyCamera.connected && sonyCamera.imageSizeValues.length > 0
+                                enabled_: sonyCamera.connected && sonyCamera.imageSizeValues.length > 0
                                 formatFn: function(v) { return sonyCamera.formatImageSize(v) }
                                 onValueSelected: function(v) { sonyCamera.setImageSize(v) }
                             }
@@ -691,7 +704,7 @@ ApplicationWindow {
                                 currentText: sonyCamera.connected ? sonyCamera.formatImageQual(sonyCamera.currentImageQual) : "—"
                                 model: sonyCamera.imageQualValues
                                 currentValue: sonyCamera.currentImageQual
-                                enabled: sonyCamera.connected && sonyCamera.imageQualValues.length > 0
+                                enabled_: sonyCamera.connected && sonyCamera.imageQualValues.length > 0
                                 formatFn: function(v) { return sonyCamera.formatImageQual(v) }
                                 onValueSelected: function(v) { sonyCamera.setImageQual(v) }
                             }
@@ -1291,7 +1304,7 @@ ApplicationWindow {
         property string  currentText:  "—"
         property var     model:        []
         property var     currentValue: 0
-        property bool    enabled:      false
+        property bool    enabled_:     false
         property var     formatFn:     function(v) { return String(v) }
         property bool    expanded:     false
 
@@ -1305,15 +1318,15 @@ ApplicationWindow {
             Row {
                 anchors.verticalCenter: parent.verticalCenter
                 anchors.left: parent.left; anchors.leftMargin: 10; spacing: 0
-                Text { text: settingRow.label; color: settingRow.enabled ? "#CCCCCC" : "#555555"; font.pixelSize: 12; width: 80; anchors.verticalCenter: parent.verticalCenter }
-                Text { text: settingRow.currentText; color: settingRow.enabled ? "#FFFFFF" : "#444444"; font.pixelSize: 12; font.bold: true; anchors.verticalCenter: parent.verticalCenter }
+                Text { text: settingRow.label; color: settingRow.enabled_ ? "#CCCCCC" : "#555555"; font.pixelSize: 12; width: 80; anchors.verticalCenter: parent.verticalCenter }
+                Text { text: settingRow.currentText; color: settingRow.enabled_ ? "#FFFFFF" : "#444444"; font.pixelSize: 12; font.bold: true; anchors.verticalCenter: parent.verticalCenter }
             }
-            Text { text: settingRow.expanded ? "▲" : "▼"; color: settingRow.enabled ? "#888888" : "#333333"; font.pixelSize: 9; anchors.verticalCenter: parent.verticalCenter; anchors.right: parent.right; anchors.rightMargin: 10 }
+            Text { text: settingRow.expanded ? "▲" : "▼"; color: settingRow.enabled_ ? "#888888" : "#333333"; font.pixelSize: 9; anchors.verticalCenter: parent.verticalCenter; anchors.right: parent.right; anchors.rightMargin: 10 }
             Rectangle { width: parent.width; height: 1; color: "#2A2A2A"; anchors.bottom: parent.bottom }
 
             MouseArea {
                 id: settingRowMouse; anchors.fill: parent; hoverEnabled: true
-                enabled: settingRow.enabled; cursorShape: Qt.PointingHandCursor
+                enabled: settingRow.enabled_; cursorShape: Qt.PointingHandCursor
                 onClicked: settingRow.expanded = !settingRow.expanded
             }
         }

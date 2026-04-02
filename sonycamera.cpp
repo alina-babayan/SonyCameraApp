@@ -5,12 +5,14 @@
 #include <QFileInfo>
 #include <QTimer>
 #include <QThreadPool>
+#include <QThread>
+#include <QDateTime>
 
 SonyCamera::SonyCamera(QObject *parent) : QObject(parent)
 {
-    m_savePath  = QStandardPaths::writableLocation(QStandardPaths::PicturesLocation) + "/SonyCaptures";
+    m_savePath = QStandardPaths::writableLocation(QStandardPaths::PicturesLocation) + "/SonyCaptures";
     QDir().mkpath(m_savePath);
-    m_savePathW = m_savePath.toStdWString();
+    m_savePathLinux = m_savePath.toStdString();
     qDebug() << "Photos will be saved to:" << m_savePath;
 
     m_lvTimer = new QTimer(this);
@@ -19,7 +21,6 @@ SonyCamera::SonyCamera(QObject *parent) : QObject(parent)
 }
 
 SonyCamera::~SonyCamera() { shutdown(); }
-
 
 bool SonyCamera::initialize()
 {
@@ -33,41 +34,64 @@ bool SonyCamera::initialize()
 
 bool SonyCamera::connectCamera()
 {
-    if (m_connected) return true;
+    if (m_connected || m_connecting) return true;
     if (!m_sdkInitialized && !initialize()) return false;
 
+    m_connecting = true;
+    emit connectingChanged(true);
+    emit logMessage("Scanning for camera...");
+
     QThreadPool::globalInstance()->start([this]() {
+        QThread::msleep(300);
+
         SCRSDK::ICrEnumCameraObjectInfo* cameraList = nullptr;
-        SCRSDK::CrError result = SCRSDK::EnumCameraObjects(&cameraList, 1);
+        SCRSDK::CrError result = SCRSDK::EnumCameraObjects(&cameraList, 5);
 
         if (result != SCRSDK::CrError_None || !cameraList) {
-            QMetaObject::invokeMethod(this, [this]() { emit errorOccurred("Camera enumeration failed."); }, Qt::QueuedConnection);
+            QMetaObject::invokeMethod(this, [this]() {
+                m_connecting = false;
+                emit connectingChanged(false);
+                emit errorOccurred("Camera enumeration failed.");
+            }, Qt::QueuedConnection);
             return;
         }
 
         CrInt32u count = cameraList->GetCount();
         if (count == 0) {
-            QMetaObject::invokeMethod(this, [this]() { emit errorOccurred("No cameras found. Plug in your Sony camera via USB."); }, Qt::QueuedConnection);
             cameraList->Release();
+            QMetaObject::invokeMethod(this, [this]() {
+                m_connecting = false;
+                emit connectingChanged(false);
+                emit errorOccurred("No cameras found. Check USB and set camera to PC Remote mode.");
+            }, Qt::QueuedConnection);
             return;
         }
 
         auto* info = const_cast<SCRSDK::ICrCameraObjectInfo*>(cameraList->GetCameraObjectInfo(0));
         SCRSDK::CrDeviceHandle handle = 0;
-        result = SCRSDK::Connect(info, this, &handle, SCRSDK::CrSdkControlMode_Remote, SCRSDK::CrReconnecting_OFF);
+
+        result = SCRSDK::Connect(info, this, &handle,
+                                 SCRSDK::CrSdkControlMode_Remote,
+                                 SCRSDK::CrReconnecting_OFF);
+
         cameraList->Release();
 
         if (result != SCRSDK::CrError_None) {
             QMetaObject::invokeMethod(this, [this, result]() {
-                emit errorOccurred(QString("Camera connection failed. Error: %1").arg(result));
+                m_connecting = false;
+                emit connectingChanged(false);
+                emit errorOccurred(QString("Camera connection failed. Error: 0x%1").arg(result, 0, 16));
             }, Qt::QueuedConnection);
             return;
         }
 
         QMetaObject::invokeMethod(this, [this, handle]() {
             cameraHandle = handle;
+            m_connecting = false;
+            emit connectingChanged(false);
         }, Qt::QueuedConnection);
     });
+
     return true;
 }
 
@@ -79,18 +103,54 @@ void SonyCamera::disconnectCamera()
         SCRSDK::ReleaseDevice(cameraHandle);
         cameraHandle = 0;
     }
+    m_connected  = false;
+    m_connecting = false;
+    emit connectingChanged(false);
 }
 
 void SonyCamera::takePhoto()
 {
-    if (!m_connected || cameraHandle == 0) { emit errorOccurred("Camera not connected."); return; }
+    if (!m_connected || cameraHandle == 0) {
+        emit errorOccurred("Camera not connected.");
+        return;
+    }
+
+    // FIX: Pause live view during capture to avoid USB bandwidth contention
+    // which causes disconnection especially with Extra Fine / large files.
+    m_lvWasActiveBeforeCapture = m_liveViewActive;
+    if (m_liveViewActive) {
+        m_lvTimer->stop();
+        qDebug() << "Live view paused for capture.";
+    }
 
     m_capturePending = true;
+    emit logMessage("Taking photo... Waiting for high-res file from camera.");
+
+    // FIX: Use longer shutter-button hold for heavy quality modes (Extra Fine)
+    // to avoid triggering a disconnect from a too-short command burst.
+    bool isHeavyQuality = (m_currentImageQual == 4 ||
+                           m_currentImageQual == static_cast<quint64>(SCRSDK::CrImageQuality_ExFine));
+    int holdMs = isHeavyQuality ? 300 : 120;
 
     SCRSDK::CrDeviceHandle h = cameraHandle;
-    QThreadPool::globalInstance()->start([h]() {
+    QThreadPool::globalInstance()->start([h, holdMs]() {
         SCRSDK::SendCommand(h, SCRSDK::CrCommandId_Release, SCRSDK::CrCommandParam_Down);
+        QThread::msleep(holdMs);
         SCRSDK::SendCommand(h, SCRSDK::CrCommandId_Release, SCRSDK::CrCommandParam_Up);
+    });
+
+    QTimer::singleShot(20000, this, [this]() {
+        if (m_capturePending) {
+            m_capturePending = false;
+            // Resume live view on timeout too
+            if (m_lvWasActiveBeforeCapture && m_liveViewActive == false && m_connected) {
+                m_liveViewActive = true;
+                emit liveViewActiveChanged(true);
+                m_lvTimer->start();
+                qDebug() << "Live view resumed after capture timeout.";
+            }
+            emit errorOccurred("Capture timeout. Please check 'PC Remote Settings' on camera.");
+        }
     });
 }
 
@@ -108,7 +168,6 @@ void SonyCamera::shutdown()
     }
 }
 
-
 void SonyCamera::startLiveView()
 {
     if (!m_connected || cameraHandle == 0) {
@@ -125,9 +184,7 @@ void SonyCamera::startLiveView()
 void SonyCamera::stopLiveView()
 {
     if (!m_liveViewActive) return;
-
     m_lvTimer->stop();
-
     m_liveViewActive = false;
     emit liveViewActiveChanged(false);
     emit logMessage("Live view stopped.");
@@ -138,40 +195,57 @@ void SonyCamera::pollLiveViewFrame()
     if (!m_connected || cameraHandle == 0 || !m_liveViewActive) return;
 
     SCRSDK::CrImageInfo imgInfo;
-    SCRSDK::CrError err = SCRSDK::GetLiveViewImageInfo(cameraHandle, &imgInfo);
-    if (err != SCRSDK::CrError_None) return;
+    if (SCRSDK::GetLiveViewImageInfo(cameraHandle, &imgInfo) != SCRSDK::CrError_None) return;
 
     CrInt32u bufSize = imgInfo.GetBufferSize();
     if (bufSize == 0) return;
-
 
     std::vector<CrInt8u> buf(bufSize);
     SCRSDK::CrImageDataBlock dataBlock;
     dataBlock.SetSize(bufSize);
     dataBlock.SetData(buf.data());
 
-    err = SCRSDK::GetLiveViewImage(cameraHandle, &dataBlock);
-    if (err != SCRSDK::CrError_None) return;
-
-    const CrInt8u* imgData  = dataBlock.GetImageData();
-    CrInt32u       imgBytes = dataBlock.GetImageSize();
-
-    if (!imgData || imgBytes == 0) return;
-
-    QByteArray jpegData(reinterpret_cast<const char*>(imgData),
-                        static_cast<int>(imgBytes));
-
-    QImage frame;
-    if (frame.loadFromData(jpegData, "JPEG") && !frame.isNull()) {
-        emit liveViewFrameReady(frame);
+    if (SCRSDK::GetLiveViewImage(cameraHandle, &dataBlock) == SCRSDK::CrError_None) {
+        QImage frame;
+        const uchar* imageData = reinterpret_cast<const uchar*>(dataBlock.GetImageData());
+        if (frame.loadFromData(imageData, static_cast<int>(dataBlock.GetImageSize()), "JPEG")) {
+            emit liveViewFrameReady(frame);
+        }
     }
 }
-
 
 void SonyCamera::fetchFocusRange()
 {
     if (!m_connected || cameraHandle == 0) return;
 
+    // FIX: First check if FocusPositionSetting is actually supported by the camera
+    // in its current mode (MF required). Querying it in AF/Auto mode triggers
+    // warning 0x00020011 and causes the camera to disconnect (error 33287 / 0x8207).
+    bool focusSettingSupported = false;
+    bool focusCurrentSupported = false;
+    {
+        SCRSDK::CrDeviceProperty* all = nullptr;
+        CrInt32 cnt = 0;
+        if (SCRSDK::GetDeviceProperties(cameraHandle, &all, &cnt) == SCRSDK::CrError_None && all) {
+            for (CrInt32 i = 0; i < cnt; i++) {
+                CrInt32u c = all[i].GetCode();
+                if (c == static_cast<CrInt32u>(SCRSDK::CrDeviceProperty_FocusPositionSetting))
+                    focusSettingSupported = true;
+                if (c == static_cast<CrInt32u>(SCRSDK::CrDeviceProperty_FocusPositionCurrentValue))
+                    focusCurrentSupported = true;
+            }
+            SCRSDK::ReleaseDeviceProperties(cameraHandle, all);
+        }
+    }
+
+    if (!focusSettingSupported) {
+        qDebug() << "FocusPositionSetting not available in current camera mode (MF required). Skipping fetchFocusRange.";
+        m_focusRangeValid = false;
+        emit focusRangeReady();
+        return;
+    }
+
+    // Query FocusPositionSetting for range + current position
     {
         CrInt32u codeArr = static_cast<CrInt32u>(SCRSDK::CrDeviceProperty_FocusPositionSetting);
         SCRSDK::CrDeviceProperty* props = nullptr;
@@ -181,7 +255,6 @@ void SonyCamera::fetchFocusRange()
 
         if (err == SCRSDK::CrError_None && props && numProps > 0) {
             SCRSDK::CrDeviceProperty& p = props[0];
-
             CrInt8u* rv   = p.GetValues();
             CrInt32u rvSz = p.GetValueSize();
 
@@ -190,7 +263,6 @@ void SonyCamera::fetchFocusRange()
                 memcpy(&mn,   rv + 0, 2);
                 memcpy(&mx,   rv + 2, 2);
                 memcpy(&step, rv + 4, 2);
-
                 if (mx > mn) {
                     m_focusMin        = mn;
                     m_focusMax        = mx;
@@ -198,13 +270,15 @@ void SonyCamera::fetchFocusRange()
                     qDebug() << "Focus range:" << mn << "-" << mx << "step" << step;
                 }
             }
-
+            // Current position comes from the same property — no need for a second query
             m_focusPosition = static_cast<quint32>(p.GetCurrentValue() & 0xFFFF);
             SCRSDK::ReleaseDeviceProperties(cameraHandle, props);
         }
     }
 
-    {
+    // FIX: Only query FocusPositionCurrentValue if the camera reports it as supported.
+    // Removed unconditional second query that also triggered warning 0x00020011.
+    if (focusCurrentSupported) {
         CrInt32u codeArr = static_cast<CrInt32u>(SCRSDK::CrDeviceProperty_FocusPositionCurrentValue);
         SCRSDK::CrDeviceProperty* props = nullptr;
         CrInt32 numProps = 0;
@@ -247,7 +321,20 @@ void SonyCamera::setFocusPosition(quint32 value)
     }
 }
 
-
+static quint64 readCurrentValue(SCRSDK::CrDeviceHandle handle,
+                                SCRSDK::CrDevicePropertyCode code)
+{
+    CrInt32u codeArr = static_cast<CrInt32u>(code);
+    SCRSDK::CrDeviceProperty* props = nullptr;
+    CrInt32 numProps = 0;
+    quint64 val = 0;
+    if (SCRSDK::GetSelectDeviceProperties(handle, 1, &codeArr, &props, &numProps)
+            == SCRSDK::CrError_None && props && numProps > 0) {
+        val = props[0].GetCurrentValue();
+        SCRSDK::ReleaseDeviceProperties(handle, props);
+    }
+    return val;
+}
 void SonyCamera::fetchProperty(SCRSDK::CrDevicePropertyCode code,
                                QVariantList& outValues, quint64& outCurrent)
 {
@@ -255,124 +342,108 @@ void SonyCamera::fetchProperty(SCRSDK::CrDevicePropertyCode code,
     outCurrent = 0;
     if (!m_connected || cameraHandle == 0) return;
 
-    CrInt32u numCodes = 1;
-    CrInt32u codeArr  = static_cast<CrInt32u>(code);
-
-    SCRSDK::CrDeviceProperty* props = nullptr;
-    CrInt32 numProps = 0;
-
-    SCRSDK::CrError err = SCRSDK::GetSelectDeviceProperties(
-        cameraHandle, numCodes, &codeArr, &props, &numProps);
-
-    if (err != SCRSDK::CrError_None || !props || numProps == 0) return;
-
-    SCRSDK::CrDeviceProperty& p = props[0];
-    outCurrent = p.GetCurrentValue();
-
     CrInt32u elemSize = 4;
-    switch (p.GetValueType()) {
-    case SCRSDK::CrDataType_UInt8:
-    case SCRSDK::CrDataType_Int8:   elemSize = 1; break;
-    case SCRSDK::CrDataType_UInt16:
-    case SCRSDK::CrDataType_Int16:  elemSize = 2; break;
-    case SCRSDK::CrDataType_UInt32:
-    case SCRSDK::CrDataType_Int32:  elemSize = 4; break;
-    case SCRSDK::CrDataType_UInt64:
-    case SCRSDK::CrDataType_Int64:  elemSize = 8; break;
+    switch (code) {
+    case SCRSDK::CrDeviceProperty_ExposureBiasCompensation:
+    case SCRSDK::CrDeviceProperty_ImageSize:
+    case SCRSDK::CrDeviceProperty_WhiteBalance:           elemSize = 2; break;
+    case SCRSDK::CrDeviceProperty_CreativeLook_Sharpness: elemSize = 1; break;
     default: elemSize = 4; break;
     }
 
-    CrInt8u* raw  = p.GetSetValues();
-    CrInt32u size = p.GetSetValueSize();
+    CrInt32u codeArr = static_cast<CrInt32u>(code);
+    SCRSDK::CrDeviceProperty* props = nullptr;
+    CrInt32 numProps = 0;
 
-    if (raw && size > 0) {
-        CrInt32u count = size / elemSize;
-        for (CrInt32u i = 0; i < count; i++) {
-            quint64 val = 0;
-            memcpy(&val, raw + i * elemSize, elemSize);
-            outValues.append(QVariant::fromValue(val));
-        }
-    } else if (p.IsSetEnableCurrentValue()) {
-        CrInt8u* rv   = p.GetValues();
-        CrInt32u rvSz = p.GetValueSize();
+    if (SCRSDK::GetSelectDeviceProperties(cameraHandle, 1, &codeArr, &props, &numProps)
+            == SCRSDK::CrError_None && props && numProps > 0)
+    {
+        outCurrent = props[0].GetCurrentValue();
 
-        qint64 mn = 0, mx = 0, step = 1;
-        bool gotRange = false;
-
-        if (rv && rvSz >= elemSize * 3) {
-            auto readVal = [&](int idx) -> qint64 {
-                qint64 v = 0;
-                memcpy(&v, rv + idx * elemSize, elemSize);
-                if      (elemSize == 1) v = static_cast<qint8>(static_cast<quint8>(v));
-                else if (elemSize == 2) v = static_cast<qint16>(static_cast<quint16>(v));
-                else if (elemSize == 4) v = static_cast<qint32>(static_cast<quint32>(v));
-                return v;
-            };
-            mn   = readVal(0);
-            mx   = readVal(1);
-            step = readVal(2);
-            if (step == 0) step = 1;
-            if (mn < mx && step > 0 && (mx - mn) / step < 10000)
-                gotRange = true;
-        }
-
-        if (!gotRange) {
-            switch (code) {
-            case SCRSDK::CrDeviceProperty_ExposureBiasCompensation:
-                mn = -5000; mx = 5000; step = 333; gotRange = true;
-                break;
-            case SCRSDK::CrDeviceProperty_CreativeLook_Sharpness:
-                mn = -3; mx = 3; step = 1; gotRange = true;
-                break;
-            case SCRSDK::CrDeviceProperty_MonitorBrightnessManual:
-                mn = -2; mx = 2; step = 1; gotRange = true;
-                break;
-            default:
-                break;
+        auto processBuffer = [&](CrInt8u* buf, CrInt32u sz) {
+            if (!buf || sz == 0) return;
+            for (CrInt32u i = 0; i < (sz / elemSize); i++) {
+                quint64 v = 0;
+                // Use a temporary buffer to ensure no out-of-bounds read
+                memcpy(&v, buf + (i * elemSize), elemSize);
+                outValues.append(v);
             }
+        };
+
+        processBuffer(props[0].GetSetValues(), props[0].GetSetValueSize());
+        if (outValues.isEmpty()) {
+            processBuffer(props[0].GetValues(), props[0].GetValueSize());
         }
 
-        if (gotRange) {
-            for (qint64 v = mn; v <= mx; v += step) {
-                quint64 bits = 0;
-                memcpy(&bits, &v, elemSize);
-                if (elemSize < 8)
-                    bits &= (quint64(1) << (elemSize * 8)) - 1;
-                outValues.append(QVariant::fromValue(bits));
-            }
-        }
+        SCRSDK::ReleaseDeviceProperties(cameraHandle, props);
     }
 
-    SCRSDK::ReleaseDeviceProperties(cameraHandle, props);
+    // Hard fallback for Quality (0x101) if values are still 0
+    if (code == SCRSDK::CrDeviceProperty_StillImageQuality && outValues.isEmpty()) {
+        outValues << (quint64)0x01 << (quint64)0x02 << (quint64)0x03
+                  << (quint64)SCRSDK::CrFileType_Raw
+                  << (quint64)SCRSDK::CrFileType_RawJpeg;
+    }
 }
 
 void SonyCamera::fetchAllSettings()
 {
-    fetchProperty(SCRSDK::CrDeviceProperty_IsoSensitivity,              m_isoValues,        m_currentISO);
-    fetchProperty(SCRSDK::CrDeviceProperty_ShutterSpeed,                m_shutterValues,    m_currentShutter);
-    fetchProperty(SCRSDK::CrDeviceProperty_ExposureBiasCompensation,    m_exposureValues,   m_currentExposure);
-    fetchProperty(SCRSDK::CrDeviceProperty_CreativeLook_Sharpness,      m_sharpnessValues,  m_currentSharpness);
-    fetchProperty(SCRSDK::CrDeviceProperty_MonitorBrightnessManual,     m_brightnessValues, m_currentBrightness);
-    fetchProperty(SCRSDK::CrDeviceProperty_ImageSize,                   m_imageSizeValues,  m_currentImageSize);
-    // Some cameras only advertise L in the allowed-values list even though M and S
-    // are valid. If the SDK gave us fewer than 2 choices, inject L / M / S manually.
+    m_currentISO = readCurrentValue(cameraHandle, SCRSDK::CrDeviceProperty_IsoSensitivity);
+    m_isoValues.clear();
+    m_isoValues.append(QVariant::fromValue(quint64(0x00FFFFFF)));
+    static const quint32 isos[] = {
+        50,64,80,100,125,160,200,250,320,400,500,640,800,1000,1250,1600,
+        2000,2500,3200,4000,5000,6400,8000,10000,12800,16000,20000,
+        25600,32000,40000,51200,64000,80000,102400
+    };
+    for (auto iso : isos)
+        m_isoValues.append(QVariant::fromValue(quint64(iso)));
+
+    // Shutter
+    m_currentShutter = readCurrentValue(cameraHandle, SCRSDK::CrDeviceProperty_ShutterSpeed);
+    m_shutterValues.clear();
+    m_shutterValues.append(QVariant::fromValue(quint64(0x00000000)));
+    static const quint32 dens[] = {
+        8000,6400,5000,4000,3200,2500,2000,1600,1250,1000,800,640,500,
+        400,320,250,200,160,125,100,80,60,50,40,30,25,20,15,13,10,8,6,5,4,3,2
+    };
+    for (auto d : dens)
+        m_shutterValues.append(QVariant::fromValue(quint64((quint32(1) << 16) | d)));
+    struct { quint32 n, d; } longs[] = {
+        {1,1},{13,10},{16,10},{2,1},{25,10},{3,1},{4,1},{5,1},
+        {6,1},{8,1},{10,1},{13,1},{15,1},{20,1},{25,1},{30,1}
+    };
+    for (auto& s : longs)
+        m_shutterValues.append(QVariant::fromValue(quint64((s.n << 16) | s.d)));
+
+    fetchProperty(SCRSDK::CrDeviceProperty_ExposureBiasCompensation, m_exposureValues,   m_currentExposure);
+    fetchProperty(SCRSDK::CrDeviceProperty_CreativeLook_Sharpness,   m_sharpnessValues,  m_currentSharpness);
+
+    m_brightnessValues.clear();
+    m_currentBrightness = 0;
+
+    fetchProperty(SCRSDK::CrDeviceProperty_ImageSize, m_imageSizeValues, m_currentImageSize);
     if (m_imageSizeValues.size() < 2) {
         m_imageSizeValues.clear();
         m_imageSizeValues.append(QVariant::fromValue(quint64(SCRSDK::CrImageSize_L)));
         m_imageSizeValues.append(QVariant::fromValue(quint64(SCRSDK::CrImageSize_M)));
         m_imageSizeValues.append(QVariant::fromValue(quint64(SCRSDK::CrImageSize_S)));
     }
-    fetchProperty(SCRSDK::CrDeviceProperty_StillImageQuality,           m_imageQualValues,  m_currentImageQual);
+    fetchProperty(SCRSDK::CrDeviceProperty_StillImageQuality, m_imageQualValues, m_currentImageQual);
+    if (m_imageQualValues.isEmpty()) {
+        m_imageQualValues.append(QVariant::fromValue(quint64(4)));
+        m_imageQualValues.append(QVariant::fromValue(quint64(2)));
+        m_imageQualValues.append(QVariant::fromValue(quint64(3)));
+        m_imageQualValues.append(QVariant::fromValue(quint64(1)));
+    }
 
     qDebug() << "Settings fetched:"
              << "ISO:" << m_isoValues.size()
              << "Shutter:" << m_shutterValues.size()
              << "EV:" << m_exposureValues.size()
-             << "Sharpness:" << m_sharpnessValues.size() << "(cur=" << m_currentSharpness << ")"
-             << "Brightness:" << m_brightnessValues.size()
-             << QString("(cur=0x%1)").arg(m_currentBrightness, 8, 16, QChar('0'))
-             << "ImgSize:" << m_imageSizeValues.size() << "(cur=" << m_currentImageSize << ")"
-             << "ImgQual:" << m_imageQualValues.size() << "(cur=" << m_currentImageQual << ")";
+             << "Sharpness:" << m_sharpnessValues.size()
+             << "ImgSize:" << m_imageSizeValues.size()
+             << "ImgQual:" << m_imageQualValues.size();
 
     emit settingsChanged();
 }
@@ -383,22 +454,13 @@ bool SonyCamera::setProperty(SCRSDK::CrDevicePropertyCode code, quint64 value)
 
     SCRSDK::CrDataType dtype;
     switch (code) {
-    case SCRSDK::CrDeviceProperty_ExposureBiasCompensation:
-        dtype = SCRSDK::CrDataType_UInt16;  break;
-    case SCRSDK::CrDeviceProperty_CreativeLook_Sharpness:
-        dtype = SCRSDK::CrDataType_Int8;    break;
-    case SCRSDK::CrDeviceProperty_MonitorBrightnessManual:
-        dtype = SCRSDK::CrDataType_Int16;   break;
-    case SCRSDK::CrDeviceProperty_ShutterSpeed:
-        dtype = SCRSDK::CrDataType_UInt32;  break;
-    case SCRSDK::CrDeviceProperty_IsoSensitivity:
-        dtype = SCRSDK::CrDataType_UInt32;  break;
-    case SCRSDK::CrDeviceProperty_ImageSize:
-        dtype = SCRSDK::CrDataType_UInt16;  break;
-    case SCRSDK::CrDeviceProperty_StillImageQuality:
-        dtype = SCRSDK::CrDataType_UInt16;  break;
-    default:
-        dtype = SCRSDK::CrDataType_UInt32;  break;
+    case SCRSDK::CrDeviceProperty_ExposureBiasCompensation: dtype = SCRSDK::CrDataType_UInt16; break;
+    case SCRSDK::CrDeviceProperty_CreativeLook_Sharpness:   dtype = SCRSDK::CrDataType_Int8;   break;
+    case SCRSDK::CrDeviceProperty_ShutterSpeed:             dtype = SCRSDK::CrDataType_UInt32; break;
+    case SCRSDK::CrDeviceProperty_IsoSensitivity:           dtype = SCRSDK::CrDataType_UInt32; break;
+    case SCRSDK::CrDeviceProperty_ImageSize:                dtype = SCRSDK::CrDataType_UInt16; break;
+    case SCRSDK::CrDeviceProperty_StillImageQuality:        dtype = SCRSDK::CrDataType_UInt32; break;
+    default:                                                dtype = SCRSDK::CrDataType_UInt32; break;
     }
 
     SCRSDK::CrDeviceProperty prop;
@@ -452,13 +514,9 @@ void SonyCamera::setSharpness(quint64 value)
 
 void SonyCamera::setBrightness(quint64 value)
 {
-    if (setProperty(SCRSDK::CrDeviceProperty_MonitorBrightnessManual, value)) {
-        m_currentBrightness = value;
-        emit settingsChanged();
-        emit logMessage(QString("Brightness set to: %1").arg(value));
-    }
+    Q_UNUSED(value);
+    emit errorOccurred("Brightness control not supported in this SDK version.");
 }
-
 
 QString SonyCamera::formatISO(quint64 raw) const
 {
@@ -495,13 +553,9 @@ QString SonyCamera::formatExposure(quint64 raw) const
 
 QString SonyCamera::formatBrightness(quint64 raw) const
 {
-    qint16 val = static_cast<qint16>(raw & 0xFFFF);
-    quint16 hi = static_cast<quint16>((raw >> 16) & 0xFFFF);
-    if (hi != 0 || val == static_cast<qint16>(0xFFFE) || val == static_cast<qint16>(0xFFFF))
-        return "—";
-    return QString::number(val);
+    Q_UNUSED(raw);
+    return "—";
 }
-
 
 void SonyCamera::fetchExifInfo()
 {
@@ -536,7 +590,7 @@ void SonyCamera::fetchExifInfo()
         return val;
     };
 
-    m_exifModel = fetchStr(SCRSDK::CrDeviceProperty_ModelName);
+    m_exifModel = fetchStr(SCRSDK::CrDeviceProperty_LensModelName);
     if (m_exifModel.isEmpty()) m_exifModel = "Unknown";
 
     m_exifLens = fetchStr(SCRSDK::CrDeviceProperty_LensModelName);
@@ -565,20 +619,18 @@ void SonyCamera::fetchExifInfo()
     {
         quint64 em = fetchUint(SCRSDK::CrDeviceProperty_ExposureProgramMode);
         switch (static_cast<quint32>(em)) {
-        case SCRSDK::CrExposure_M_Manual:            m_exifExposureMode = "Manual (M)";       break;
-        case SCRSDK::CrExposure_P_Auto:              m_exifExposureMode = "Program (P)";      break;
-        case SCRSDK::CrExposure_A_AperturePriority:  m_exifExposureMode = "Aperture (A)";     break;
-        case SCRSDK::CrExposure_S_ShutterSpeedPriority: m_exifExposureMode = "Shutter (S)";   break;
-        case SCRSDK::CrExposure_Auto:                m_exifExposureMode = "Intelligent Auto"; break;
-        case SCRSDK::CrExposure_Auto_Plus:           m_exifExposureMode = "Superior Auto";    break;
-        case SCRSDK::CrExposure_Movie_P:             m_exifExposureMode = "Movie P";          break;
-        case SCRSDK::CrExposure_Movie_A:             m_exifExposureMode = "Movie A";          break;
-        case SCRSDK::CrExposure_Movie_S:             m_exifExposureMode = "Movie S";          break;
-        case SCRSDK::CrExposure_Movie_M:             m_exifExposureMode = "Movie M";          break;
+        case SCRSDK::CrExposure_M_Manual:               m_exifExposureMode = "Manual (M)";       break;
+        case SCRSDK::CrExposure_P_Auto:                 m_exifExposureMode = "Program (P)";      break;
+        case SCRSDK::CrExposure_A_AperturePriority:     m_exifExposureMode = "Aperture (A)";     break;
+        case SCRSDK::CrExposure_S_ShutterSpeedPriority: m_exifExposureMode = "Shutter (S)";      break;
+        case SCRSDK::CrExposure_Auto:                   m_exifExposureMode = "Intelligent Auto"; break;
+        case SCRSDK::CrExposure_Auto_Plus:              m_exifExposureMode = "Superior Auto";    break;
+        case SCRSDK::CrExposure_Movie_P:                m_exifExposureMode = "Movie P";          break;
+        case SCRSDK::CrExposure_Movie_A:                m_exifExposureMode = "Movie A";          break;
+        case SCRSDK::CrExposure_Movie_S:                m_exifExposureMode = "Movie S";          break;
+        case SCRSDK::CrExposure_Movie_M:                m_exifExposureMode = "Movie M";          break;
         default:
-            m_exifExposureMode = em > 0
-                                     ? QString("Mode 0x%1").arg(em, 0, 16)
-                                     : "—";
+            m_exifExposureMode = em > 0 ? QString("Mode 0x%1").arg(em, 0, 16) : "—";
             break;
         }
     }
@@ -586,19 +638,19 @@ void SonyCamera::fetchExifInfo()
     {
         quint64 wb = fetchUint(SCRSDK::CrDeviceProperty_WhiteBalance);
         switch (static_cast<quint16>(wb & 0xFFFF)) {
-        case SCRSDK::CrWhiteBalance_AWB:                   m_exifWhiteBalance = "Auto";              break;
-        case SCRSDK::CrWhiteBalance_Daylight:              m_exifWhiteBalance = "Daylight";          break;
-        case SCRSDK::CrWhiteBalance_Shadow:                m_exifWhiteBalance = "Shadow";            break;
-        case SCRSDK::CrWhiteBalance_Cloudy:                m_exifWhiteBalance = "Cloudy";            break;
-        case SCRSDK::CrWhiteBalance_Tungsten:              m_exifWhiteBalance = "Tungsten";          break;
-        case SCRSDK::CrWhiteBalance_Fluorescent:           m_exifWhiteBalance = "Fluorescent";       break;
-        case SCRSDK::CrWhiteBalance_Flush:                 m_exifWhiteBalance = "Flash";             break;
-        case SCRSDK::CrWhiteBalance_ColorTemp:             m_exifWhiteBalance = "Color Temp";        break;
-        case SCRSDK::CrWhiteBalance_Custom_1:              m_exifWhiteBalance = "Custom 1";          break;
-        case SCRSDK::CrWhiteBalance_Custom_2:              m_exifWhiteBalance = "Custom 2";          break;
-        case SCRSDK::CrWhiteBalance_Custom_3:              m_exifWhiteBalance = "Custom 3";          break;
-        case SCRSDK::CrWhiteBalance_Custom:                m_exifWhiteBalance = "Custom";            break;
-        case SCRSDK::CrWhiteBalance_Underwater_Auto:       m_exifWhiteBalance = "Underwater Auto";   break;
+        case SCRSDK::CrWhiteBalance_AWB:             m_exifWhiteBalance = "Auto";            break;
+        case SCRSDK::CrWhiteBalance_Daylight:        m_exifWhiteBalance = "Daylight";        break;
+        case SCRSDK::CrWhiteBalance_Shadow:          m_exifWhiteBalance = "Shadow";          break;
+        case SCRSDK::CrWhiteBalance_Cloudy:          m_exifWhiteBalance = "Cloudy";          break;
+        case SCRSDK::CrWhiteBalance_Tungsten:        m_exifWhiteBalance = "Tungsten";        break;
+        case SCRSDK::CrWhiteBalance_Fluorescent:     m_exifWhiteBalance = "Fluorescent";     break;
+        case SCRSDK::CrWhiteBalance_Flush:           m_exifWhiteBalance = "Flash";           break;
+        case SCRSDK::CrWhiteBalance_ColorTemp:       m_exifWhiteBalance = "Color Temp";      break;
+        case SCRSDK::CrWhiteBalance_Custom_1:        m_exifWhiteBalance = "Custom 1";        break;
+        case SCRSDK::CrWhiteBalance_Custom_2:        m_exifWhiteBalance = "Custom 2";        break;
+        case SCRSDK::CrWhiteBalance_Custom_3:        m_exifWhiteBalance = "Custom 3";        break;
+        case SCRSDK::CrWhiteBalance_Custom:          m_exifWhiteBalance = "Custom";          break;
+        case SCRSDK::CrWhiteBalance_Underwater_Auto: m_exifWhiteBalance = "Underwater Auto"; break;
         default:
             m_exifWhiteBalance = wb > 0 ? QString("0x%1").arg(wb, 0, 16) : "—";
             break;
@@ -608,191 +660,218 @@ void SonyCamera::fetchExifInfo()
     {
         quint64 bat = fetchUint(SCRSDK::CrDeviceProperty_BatteryLevel);
         switch (static_cast<quint32>(bat)) {
-        case SCRSDK::CrBatteryLevel_PreEndBattery:   m_exifBatteryLevel = "Critical";      break;
-        case SCRSDK::CrBatteryLevel_1_4:             m_exifBatteryLevel = "25%";           break;
-        case SCRSDK::CrBatteryLevel_2_4:             m_exifBatteryLevel = "50%";           break;
-        case SCRSDK::CrBatteryLevel_3_4:             m_exifBatteryLevel = "75%";           break;
-        case SCRSDK::CrBatteryLevel_4_4:             m_exifBatteryLevel = "100%";          break;
-        case SCRSDK::CrBatteryLevel_1_3:             m_exifBatteryLevel = "33%";           break;
-        case SCRSDK::CrBatteryLevel_2_3:             m_exifBatteryLevel = "66%";           break;
-        case SCRSDK::CrBatteryLevel_3_3:             m_exifBatteryLevel = "100%";          break;
-        case SCRSDK::CrBatteryLevel_USBPowerSupply:  m_exifBatteryLevel = "USB Power";     break;
-        case SCRSDK::CrBatteryLevel_BatteryNotInstalled: m_exifBatteryLevel = "No Battery"; break;
+        case SCRSDK::CrBatteryLevel_PreEndBattery:  m_exifBatteryLevel = "Critical";   break;
+        case SCRSDK::CrBatteryLevel_1_4:            m_exifBatteryLevel = "25%";        break;
+        case SCRSDK::CrBatteryLevel_2_4:            m_exifBatteryLevel = "50%";        break;
+        case SCRSDK::CrBatteryLevel_3_4:            m_exifBatteryLevel = "75%";        break;
+        case SCRSDK::CrBatteryLevel_4_4:            m_exifBatteryLevel = "100%";       break;
+        case SCRSDK::CrBatteryLevel_1_3:            m_exifBatteryLevel = "33%";        break;
+        case SCRSDK::CrBatteryLevel_2_3:            m_exifBatteryLevel = "66%";        break;
+        case SCRSDK::CrBatteryLevel_3_3:            m_exifBatteryLevel = "100%";       break;
+        case SCRSDK::CrBatteryLevel_USBPowerSupply: m_exifBatteryLevel = "USB Power";  break;
         default:
             m_exifBatteryLevel = bat > 0 ? QString("Level 0x%1").arg(bat, 0, 16) : "—";
             break;
         }
     }
 
-    qDebug() << "EXIF — model:" << m_exifModel << "lens:" << m_exifLens
-             << "aperture:" << m_exifAperture << "mode:" << m_exifExposureMode
-             << "WB:" << m_exifWhiteBalance << "battery:" << m_exifBatteryLevel;
+    qDebug() << "EXIF — lens:" << m_exifLens
+             << "aperture:" << m_exifAperture
+             << "mode:" << m_exifExposureMode
+             << "WB:" << m_exifWhiteBalance
+             << "battery:" << m_exifBatteryLevel;
 
     emit exifReady();
 }
-
 
 void SonyCamera::setupSaveInfo()
 {
     SCRSDK::CrError err = SCRSDK::SetSaveInfo(
         cameraHandle,
-        const_cast<CrChar*>(m_savePathW.c_str()),
-        const_cast<CrChar*>(L""),
-        SCRSDK::CrSETSAVEINFO_AUTO_NUMBER);
+        const_cast<CrChar*>(m_savePathLinux.c_str()),
+        const_cast<CrChar*>("IMG"), 0);
+
+    if (err != SCRSDK::CrError_None)
+        err = SCRSDK::SetSaveInfo(
+            cameraHandle,
+            const_cast<CrChar*>(m_savePathLinux.c_str()),
+            const_cast<CrChar*>(""), 1);
+
+    if (err != SCRSDK::CrError_None)
+        err = SCRSDK::SetSaveInfo(
+            cameraHandle,
+            const_cast<CrChar*>(m_savePathLinux.c_str()),
+            nullptr, 0);
 
     if (err == SCRSDK::CrError_None) {
-        emit logMessage("Save folder set: " + m_savePath);
+        m_saveSupported = true;
+        emit logMessage("Full-res download enabled → " + m_savePath);
     } else {
-        emit errorOccurred(QString("SetSaveInfo failed: %1").arg(err));
+        m_saveSupported = false;
+        qDebug() << "SetSaveInfo ALL variants failed. Last error: 0x" << Qt::hex << err;
+        emit logMessage(QString(
+                            "⚠ SetSaveInfo failed (0x%1). "
+                            "On camera: Menu → PC Remote Settings → Still Img. Save Dest. → 'PC Only'. "
+                            "Until then, photos are captured from live-view (low resolution).")
+                            .arg(static_cast<uint>(err), 0, 16));
+
     }
 
-    SCRSDK::SetDeviceSetting(cameraHandle, SCRSDK::Setting_Key_EnablePostView,          SCRSDK::CrDeviceSetting_Enable);
-    SCRSDK::SetDeviceSetting(cameraHandle, SCRSDK::Setting_Key_PostViewTransferringType, 0x0001);
-    SCRSDK::SetDeviceSetting(cameraHandle, SCRSDK::Setting_Key_PartialBuffer,            1);
+    SCRSDK::SetDeviceSetting(cameraHandle, SCRSDK::Setting_Key_EnableLiveView, SCRSDK::CrDeviceSetting_Enable);
 
-    QTimer::singleShot(500, this, [this]() { fetchAllSettings(); });
-    QTimer::singleShot(800, this, [this]() { fetchFocusRange(); });
+    QTimer::singleShot(1500, this, [this]() {
+        if(m_connected) fetchAllSettings();
+    });
+
+    QTimer::singleShot(2500, this, [this]() {
+        if(m_connected) fetchFocusRange();
+    });
+    QTimer::singleShot(500,  this, [this]() { fetchAllSettings(); });
+    QTimer::singleShot(2000, this, [this]() { fetchFocusRange(); });
 }
-
 
 void SonyCamera::OnConnected(SCRSDK::DeviceConnectionVersioin version)
 {
+    Q_UNUSED(version);
     qDebug() << "Camera connected!";
-    m_connected = true;
-    emit connectionChanged(true);
-    QTimer::singleShot(300, this, [this]() { setupSaveInfo(); });
+    QMetaObject::invokeMethod(this, [this]() {
+        m_connected  = true;
+        m_connecting = false;
+        emit connectingChanged(false);
+        emit connectionChanged(true);
+        QTimer::singleShot(300, this, [this]() { setupSaveInfo(); });
+    }, Qt::QueuedConnection);
 }
 
 void SonyCamera::OnDisconnected(CrInt32u error)
 {
     qDebug() << "Camera disconnected. Code:" << error;
-    m_lvTimer->stop();
-    m_liveViewActive = false;
-    emit liveViewActiveChanged(false);
-    m_connected = false;
-    cameraHandle = 0;
-    emit connectionChanged(false);
+    QMetaObject::invokeMethod(this, [this]() {
+        m_lvTimer->stop();
+        m_liveViewActive = false;
+        emit liveViewActiveChanged(false);
+        m_connected  = false;
+        m_connecting = false;
+        cameraHandle = 0;
+        m_capturePending = false;
+        m_lvWasActiveBeforeCapture = false;
+        emit connectingChanged(false);
+        emit connectionChanged(false);
+    }, Qt::QueuedConnection);
 }
 
 void SonyCamera::OnPropertyChanged()
 {
-    if (m_connected) {
-        QTimer::singleShot(200, this, [this]() { fetchAllSettings(); });
-        QTimer::singleShot(220, this, [this]() {
-            if (!m_connected || cameraHandle == 0 || m_focusDragging) return;
-            CrInt32u codeArr = static_cast<CrInt32u>(SCRSDK::CrDeviceProperty_FocusPositionCurrentValue);
-            SCRSDK::CrDeviceProperty* props = nullptr;
-            CrInt32 numProps = 0;
-            SCRSDK::CrError err = SCRSDK::GetSelectDeviceProperties(
-                cameraHandle, 1, &codeArr, &props, &numProps);
-            if (err == SCRSDK::CrError_None && props && numProps > 0) {
-                quint32 live = static_cast<quint32>(props[0].GetCurrentValue() & 0xFFFF);
-                if (live > 0 && live != m_focusPosition) {
-                    m_focusPosition = live;
-                    emit focusPositionChanged(m_focusPosition);
-                }
-                SCRSDK::ReleaseDeviceProperties(cameraHandle, props);
-            }
+    QMetaObject::invokeMethod(this, [this]() {
+        if (!m_connected) return;
+        if (m_capturePending) return;
+        m_settingsFetchPending = true;
+        if (m_propertyDebounceTimer) {
+            m_propertyDebounceTimer->stop();
+            m_propertyDebounceTimer->deleteLater();
+        }
+        m_propertyDebounceTimer = new QTimer(this);
+        m_propertyDebounceTimer->setSingleShot(true);
+        m_propertyDebounceTimer->setInterval(2000);
+        connect(m_propertyDebounceTimer, &QTimer::timeout, this, [this]() {
+            m_propertyDebounceTimer = nullptr;
+            m_settingsFetchPending  = false;
+            if (!m_connected || m_capturePending) return;
+            fetchAllSettings();
         });
-    }
+        m_propertyDebounceTimer->start();
+    }, Qt::QueuedConnection);
 }
 
 void SonyCamera::OnLvPropertyChanged()
 {
-    if (!m_connected || cameraHandle == 0) return;
-
-    SCRSDK::CrImageInfo imgInfo;
-    if (SCRSDK::GetLiveViewImageInfo(cameraHandle, &imgInfo) != SCRSDK::CrError_None) return;
-    CrInt32u bufSize = imgInfo.GetBufferSize();
-    if (bufSize == 0) return;
-
-    std::vector<CrInt8u> buf(bufSize);
-    SCRSDK::CrImageDataBlock dataBlock;
-    dataBlock.SetSize(bufSize);
-    dataBlock.SetData(buf.data());
-    if (SCRSDK::GetLiveViewImage(cameraHandle, &dataBlock) != SCRSDK::CrError_None) return;
-
-    const CrInt8u* imgData  = dataBlock.GetImageData();
-    CrInt32u       imgBytes = dataBlock.GetImageSize();
-    if (!imgData || imgBytes == 0) return;
-
-    QByteArray jpegData(reinterpret_cast<const char*>(imgData), static_cast<int>(imgBytes));
-    QImage frame;
-    if (!frame.loadFromData(jpegData, "JPEG") || frame.isNull()) return;
-
-    if (m_capturePending) {
-        m_capturePending = false;
-        QMetaObject::invokeMethod(this, [this, frame]() {
-            emit postViewFrameReady(frame);
-        }, Qt::QueuedConnection);
-    } else if (m_liveViewActive) {
-        QMetaObject::invokeMethod(this, [this, frame]() {
-            emit liveViewFrameReady(frame);
-        }, Qt::QueuedConnection);
-    }
 }
 
 void SonyCamera::OnCompleteDownload(CrChar* filename, CrInt32u type)
 {
-    if (!filename) { emit errorOccurred("Download callback: filename is null."); return; }
-    QString localPath = QString::fromWCharArray(filename);
-    bool isPreview = (type == 0x0001);
-    qDebug() << (isPreview ? "Preview (2M) downloaded:" : "Full-res downloaded:") << localPath;
+    qDebug() << "OnCompleteDownload called, type:" << type
+             << "filename:" << (filename ? QString::fromLocal8Bit(filename) : "null");
 
-    if (QFileInfo::exists(localPath)) {
-        emit photoTaken(localPath);
+    if (!filename) {
+        QMetaObject::invokeMethod(this, [this]() {
+            emit errorOccurred("Download callback: filename is null.");
+        }, Qt::QueuedConnection);
         return;
     }
 
-    // Poll every 20ms (max 15 attempts = 300ms) instead of a flat 300ms blind wait.
+    QString localPath = QString::fromLocal8Bit(filename);
+    bool isPreview = (type == 0x0001);
+    qDebug() << (isPreview ? "Preview" : "Full-res") << "downloaded type=0x"
+             << Qt::hex << type << localPath;
+
+    if (isPreview) return;
+
+    QMetaObject::invokeMethod(this, [this]() {
+        m_capturePending = false;
+
+        // FIX: Resume live view now that the full-res file has been transferred.
+        if (m_lvWasActiveBeforeCapture && !m_liveViewActive && m_connected) {
+            m_liveViewActive = true;
+            emit liveViewActiveChanged(true);
+            m_lvTimer->start();
+            qDebug() << "Live view resumed after capture download.";
+        }
+        m_lvWasActiveBeforeCapture = false;
+    }, Qt::QueuedConnection);
+
     struct PollState { QString path; int attempts; };
     auto* state = new PollState{ localPath, 0 };
-    auto* timer = new QTimer(this);
-    timer->setInterval(20);
-    connect(timer, &QTimer::timeout, this, [this, state, timer]() {
-        state->attempts++;
-        if (QFileInfo::exists(state->path)) {
-            emit photoTaken(state->path);
-            timer->stop(); timer->deleteLater(); delete state;
-        } else if (state->attempts >= 15) {
-            emit errorOccurred("Photo file not found: " + state->path);
-            timer->stop(); timer->deleteLater(); delete state;
-        }
-    });
-    timer->start();
+
+    QMetaObject::invokeMethod(this, [this, state]() {
+        auto* timer = new QTimer(this);
+        timer->setInterval(100);
+        connect(timer, &QTimer::timeout, this, [this, state, timer]() {
+            state->attempts++;
+            if (QFileInfo::exists(state->path)) {
+                qint64 sz = QFileInfo(state->path).size();
+                if (sz > 0) {
+                    emit logMessage(QString("Photo saved (%1 MB): ").arg(sz/1024.0/1024.0, 0,'f',1) + state->path);
+                    emit photoTaken(state->path);
+                    timer->stop(); timer->deleteLater(); delete state;
+                }
+            } else if (state->attempts >= 60) {
+                emit errorOccurred("Photo file not found after download: " + state->path);
+                timer->stop(); timer->deleteLater(); delete state;
+            }
+        });
+        timer->start();
+    }, Qt::QueuedConnection);
 }
 
-void SonyCamera::OnWarning(CrInt32u w)   { qDebug() << "Warning:" << QString("0x%1").arg(w, 8, 16, QChar('0')); }
-void SonyCamera::OnWarningExt(CrInt32u w, CrInt32, CrInt32, CrInt32) { qDebug() << "Warning ext:" << w; }
-void SonyCamera::OnError(CrInt32u error) { emit errorOccurred(QString("Camera error: 0x%1").arg(error, 8, 16, QChar('0'))); }
+void SonyCamera::OnWarning(CrInt32u w)
+{ qDebug() << "Warning:" << QString("0x%1").arg(w, 8, 16, QChar('0')); }
+
+void SonyCamera::OnWarningExt(CrInt32u w, CrInt32, CrInt32, CrInt32)
+{ qDebug() << "Warning ext:" << w; }
+
+void SonyCamera::OnError(CrInt32u error)
+{ emit errorOccurred(QString("Camera error: 0x%1").arg(error, 8, 16, QChar('0'))); }
 
 bool SonyCamera::isConnected() const { return m_connected; }
 
-
-
-
 void SonyCamera::setWhiteBalance(quint32 value)
 {
-    if (!setProperty(SCRSDK::CrDeviceProperty_WhiteBalance,
-                     static_cast<quint64>(value)))
-    {
+    if (!setProperty(SCRSDK::CrDeviceProperty_WhiteBalance, static_cast<quint64>(value))) {
         emit errorOccurred("Failed to set White Balance");
         return;
     }
 
     QString label;
     switch (static_cast<quint16>(value & 0xFFFF)) {
-    case SCRSDK::CrWhiteBalance_AWB:             label = "Auto";             break;
-    case SCRSDK::CrWhiteBalance_Daylight:        label = "Daylight";         break;
-    case SCRSDK::CrWhiteBalance_Shadow:          label = "Shade";            break;
-    case SCRSDK::CrWhiteBalance_Cloudy:          label = "Cloudy";           break;
-    case SCRSDK::CrWhiteBalance_Tungsten:        label = "Incandescent";     break;
-    case SCRSDK::CrWhiteBalance_Fluorescent:     label = "Fluorescent";      break;
-    case SCRSDK::CrWhiteBalance_Flush:           label = "Flash";            break;
-    case SCRSDK::CrWhiteBalance_Custom:          label = "Custom";           break;
-    default:
-        label = QString("0x%1").arg(value, 0, 16);
-        break;
+    case SCRSDK::CrWhiteBalance_AWB:         label = "Auto";         break;
+    case SCRSDK::CrWhiteBalance_Daylight:    label = "Daylight";     break;
+    case SCRSDK::CrWhiteBalance_Shadow:      label = "Shade";        break;
+    case SCRSDK::CrWhiteBalance_Cloudy:      label = "Cloudy";       break;
+    case SCRSDK::CrWhiteBalance_Tungsten:    label = "Incandescent"; break;
+    case SCRSDK::CrWhiteBalance_Fluorescent: label = "Fluorescent";  break;
+    case SCRSDK::CrWhiteBalance_Flush:       label = "Flash";        break;
+    case SCRSDK::CrWhiteBalance_Custom:      label = "Custom";       break;
+    default: label = QString("0x%1").arg(value, 0, 16); break;
     }
 
     emit settingsChanged();
@@ -801,7 +880,7 @@ void SonyCamera::setWhiteBalance(quint32 value)
 
 void SonyCamera::setImageSize(quint64 value)
 {
-    if (!setProperty(SCRSDK::CrDeviceProperty_ImageSize, static_cast<quint64>(value))) {
+    if (!setProperty(SCRSDK::CrDeviceProperty_ImageSize, value)) {
         emit errorOccurred("Failed to set Image Size");
         return;
     }
@@ -812,13 +891,17 @@ void SonyCamera::setImageSize(quint64 value)
 
 void SonyCamera::setImageQual(quint64 value)
 {
-    if (!setProperty(SCRSDK::CrDeviceProperty_StillImageQuality, static_cast<quint64>(value))) {
-        emit errorOccurred("Failed to set Image Quality");
+    if (!m_connected || cameraHandle == 0) return;
+
+    qDebug() << "Setting Quality to:" << formatImageQual(value) << " (Value:" << value << ")";
+    if (!setProperty(SCRSDK::CrDeviceProperty_StillImageQuality, value)) {
+        emit errorOccurred("Failed to set Quality. Camera might not support this mode in current Dial position.");
         return;
     }
+
     m_currentImageQual = value;
     emit settingsChanged();
-    emit logMessage("Image Quality → " + formatImageQual(value));
+    emit logMessage("Quality changed to → " + formatImageQual(value));
 }
 
 QString SonyCamera::formatImageSize(quint64 raw) const
@@ -828,27 +911,21 @@ QString SonyCamera::formatImageSize(quint64 raw) const
     case SCRSDK::CrImageSize_M:   return "M";
     case SCRSDK::CrImageSize_S:   return "S";
     case SCRSDK::CrImageSize_VGA: return "VGA";
-    default:
-        return raw > 0 ? QString("0x%1").arg(raw, 0, 16) : "—";
+    default: return raw > 0 ? QString("0x%1").arg(raw, 0, 16) : "—";
     }
 }
 
 QString SonyCamera::formatImageQual(quint64 raw) const
 {
-    switch (static_cast<quint16>(raw)) {
-    case SCRSDK::CrFileType_Raw:      return "RAW";
-    case SCRSDK::CrFileType_RawJpeg:  return "RAW+JPEG";
-    case SCRSDK::CrFileType_RawHeif:  return "RAW+HEIF";
-    case SCRSDK::CrFileType_Heif:     return "HEIF";
-    case SCRSDK::CrFileType_Jpeg:     return "JPEG";
-    default:
-        switch (static_cast<quint16>(raw)) {
-        case SCRSDK::CrImageQuality_ExFine:   return "JPEG X.Fine";
-        case SCRSDK::CrImageQuality_Fine:     return "JPEG Fine";
-        case SCRSDK::CrImageQuality_Standard: return "JPEG Std";
-        case SCRSDK::CrImageQuality_Light:    return "JPEG Light";
-        default:
-            return raw > 0 ? QString("0x%1").arg(raw, 0, 16) : "—";
-        }
-    }
+    uint32_t val = static_cast<uint32_t>(raw);
+
+    // Sony standard mapping for Quality
+    if (val == 0x01) return "Extra Fine";
+    if (val == 0x02) return "Fine";
+    if (val == 0x03) return "Standard";
+
+    if (val == SCRSDK::CrFileType_Raw)     return "RAW";
+    if (val == SCRSDK::CrFileType_RawJpeg) return "RAW+JPEG";
+
+    return raw > 0 ? QString("0x%1").arg(raw, 0, 16) : "—";
 }

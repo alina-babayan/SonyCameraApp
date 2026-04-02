@@ -18,8 +18,6 @@ int main(int argc, char *argv[])
                          lvProvider->updateFrame(frame);
                      });
 
-    // Post-view frame: shot preview arrives in memory before the file hits disk.
-    // Push it into the same provider so QML can display it with zero disk I/O.
     QObject::connect(&camera, &SonyCamera::postViewFrameReady,
                      [lvProvider](const QImage& frame) {
                          lvProvider->updateFrame(frame);

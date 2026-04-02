@@ -6,6 +6,7 @@
 #include <QTimer>
 #include <QVariantList>
 #include <QImage>
+#include <string>
 #include "CameraRemote_SDK.h"
 #include "IDeviceCallback.h"
 
@@ -15,26 +16,27 @@ class SonyCamera : public QObject, public SCRSDK::IDeviceCallback
     Q_PROPERTY(bool connected READ isConnected NOTIFY connectionChanged)
     Q_PROPERTY(bool liveViewActive READ isLiveViewActive NOTIFY liveViewActiveChanged)
 
-    Q_PROPERTY(QVariantList isoValues      READ isoValues      NOTIFY settingsChanged)
-    Q_PROPERTY(QVariantList shutterValues  READ shutterValues  NOTIFY settingsChanged)
-    Q_PROPERTY(QVariantList exposureValues READ exposureValues NOTIFY settingsChanged)
-    Q_PROPERTY(QVariantList sharpnessValues READ sharpnessValues NOTIFY settingsChanged)
+    Q_PROPERTY(QVariantList isoValues        READ isoValues        NOTIFY settingsChanged)
+    Q_PROPERTY(QVariantList shutterValues    READ shutterValues    NOTIFY settingsChanged)
+    Q_PROPERTY(QVariantList exposureValues   READ exposureValues   NOTIFY settingsChanged)
+    Q_PROPERTY(QVariantList sharpnessValues  READ sharpnessValues  NOTIFY settingsChanged)
     Q_PROPERTY(QVariantList brightnessValues READ brightnessValues NOTIFY settingsChanged)
     Q_PROPERTY(QVariantList imageSizeValues  READ imageSizeValues  NOTIFY settingsChanged)
     Q_PROPERTY(QVariantList imageQualValues  READ imageQualValues  NOTIFY settingsChanged)
 
-    Q_PROPERTY(quint64 currentISO       READ currentISO       NOTIFY settingsChanged)
-    Q_PROPERTY(quint64 currentShutter   READ currentShutter   NOTIFY settingsChanged)
-    Q_PROPERTY(quint64 currentExposure  READ currentExposure  NOTIFY settingsChanged)
-    Q_PROPERTY(quint64 currentSharpness READ currentSharpness NOTIFY settingsChanged)
+    Q_PROPERTY(bool connecting READ isConnecting NOTIFY connectingChanged)
+    Q_PROPERTY(quint64 currentISO        READ currentISO        NOTIFY settingsChanged)
+    Q_PROPERTY(quint64 currentShutter    READ currentShutter    NOTIFY settingsChanged)
+    Q_PROPERTY(quint64 currentExposure   READ currentExposure   NOTIFY settingsChanged)
+    Q_PROPERTY(quint64 currentSharpness  READ currentSharpness  NOTIFY settingsChanged)
     Q_PROPERTY(quint64 currentBrightness READ currentBrightness NOTIFY settingsChanged)
     Q_PROPERTY(quint64 currentImageSize  READ currentImageSize  NOTIFY settingsChanged)
     Q_PROPERTY(quint64 currentImageQual  READ currentImageQual  NOTIFY settingsChanged)
 
-    Q_PROPERTY(quint32 focusPosition    READ focusPosition    NOTIFY focusPositionChanged)
-    Q_PROPERTY(quint32 focusMin         READ focusMin         NOTIFY focusRangeReady)
-    Q_PROPERTY(quint32 focusMax         READ focusMax         NOTIFY focusRangeReady)
-    Q_PROPERTY(bool    focusRangeValid  READ focusRangeValid  NOTIFY focusRangeReady)
+    Q_PROPERTY(quint32 focusPosition   READ focusPosition   NOTIFY focusPositionChanged)
+    Q_PROPERTY(quint32 focusMin        READ focusMin        NOTIFY focusRangeReady)
+    Q_PROPERTY(quint32 focusMax        READ focusMax        NOTIFY focusRangeReady)
+    Q_PROPERTY(bool    focusRangeValid READ focusRangeValid NOTIFY focusRangeReady)
 
 public:
     explicit SonyCamera(QObject *parent = nullptr);
@@ -43,21 +45,21 @@ public:
     bool isConnected() const;
     bool isLiveViewActive() const { return m_liveViewActive; }
 
-    QVariantList isoValues()       const { return m_isoValues; }
-    QVariantList shutterValues()   const { return m_shutterValues; }
-    QVariantList exposureValues()  const { return m_exposureValues; }
-    QVariantList sharpnessValues() const { return m_sharpnessValues; }
-    QVariantList brightnessValues()const { return m_brightnessValues; }
-    QVariantList imageSizeValues() const { return m_imageSizeValues; }
-    QVariantList imageQualValues() const { return m_imageQualValues; }
+    QVariantList isoValues()        const { return m_isoValues; }
+    QVariantList shutterValues()    const { return m_shutterValues; }
+    QVariantList exposureValues()   const { return m_exposureValues; }
+    QVariantList sharpnessValues()  const { return m_sharpnessValues; }
+    QVariantList brightnessValues() const { return m_brightnessValues; }
+    QVariantList imageSizeValues()  const { return m_imageSizeValues; }
+    QVariantList imageQualValues()  const { return m_imageQualValues; }
 
-    quint64 currentISO()       const { return m_currentISO; }
-    quint64 currentShutter()   const { return m_currentShutter; }
-    quint64 currentExposure()  const { return m_currentExposure; }
-    quint64 currentSharpness() const { return m_currentSharpness; }
-    quint64 currentBrightness()const { return m_currentBrightness; }
-    quint64 currentImageSize() const { return m_currentImageSize; }
-    quint64 currentImageQual() const { return m_currentImageQual; }
+    quint64 currentISO()        const { return m_currentISO; }
+    quint64 currentShutter()    const { return m_currentShutter; }
+    quint64 currentExposure()   const { return m_currentExposure; }
+    quint64 currentSharpness()  const { return m_currentSharpness; }
+    quint64 currentBrightness() const { return m_currentBrightness; }
+    quint64 currentImageSize()  const { return m_currentImageSize; }
+    quint64 currentImageQual()  const { return m_currentImageQual; }
 
     quint32 focusPosition()   const { return m_focusPosition; }
     quint32 focusMin()        const { return m_focusMin; }
@@ -112,27 +114,31 @@ signals:
     void logMessage(const QString& message);
     void settingsChanged();
     void exifReady();
-
     void liveViewActiveChanged(bool active);
     void liveViewFrameReady(const QImage& frame);
-
-    // Fired with the post-view JPEG decoded in memory — arrives before the file
-    // is written to disk, so the UI can show the shot with zero disk round-trip.
     void postViewFrameReady(const QImage& frame);
-
     void focusPositionChanged(quint32 position);
     void focusRangeReady();
+    void connectingChanged(bool connecting);
 
 public:
-
     void OnConnected(SCRSDK::DeviceConnectionVersioin version) override;
     void OnDisconnected(CrInt32u error) override;
     void OnPropertyChanged() override;
+    void OnPropertyChangedCodes(CrInt32u num, CrInt32u* codes) override
+    { Q_UNUSED(num); Q_UNUSED(codes); }
     void OnLvPropertyChanged() override;
+    void OnLvPropertyChangedCodes(CrInt32u num, CrInt32u* codes) override
+    { Q_UNUSED(num); Q_UNUSED(codes); }
     void OnCompleteDownload(CrChar* filename, CrInt32u type) override;
+    void OnNotifyContentsTransfer(CrInt32u notify, CrInt32u handle, CrChar* filename) override
+    { Q_UNUSED(notify); Q_UNUSED(handle); Q_UNUSED(filename); }
     void OnWarning(CrInt32u warning) override;
     void OnWarningExt(CrInt32u warning, CrInt32 p1, CrInt32 p2, CrInt32 p3) override;
     void OnError(CrInt32u error) override;
+
+
+    bool isConnecting() const { return m_connecting; }
 
 private:
     void setupSaveInfo();
@@ -143,21 +149,28 @@ private:
     void pollLiveViewFrame();
 
     SCRSDK::CrDeviceHandle cameraHandle  = 0;
-    bool m_connected      = false;
+    bool m_connected  = false;
+    bool m_connecting = false;
     bool m_sdkInitialized = false;
     bool m_liveViewActive = false;
-    QString  m_savePath;
-    std::wstring m_savePathW;
+    bool m_settingsFetchPending = false;
+    QTimer* m_propertyDebounceTimer = nullptr;
+    bool m_postViewPending = false;
+
+    QString m_savePath;
+    std::string m_savePathLinux;
 
     QTimer* m_lvTimer = nullptr;
-    bool    m_capturePending = false;  // true between shutter and post-view frame
+    bool m_saveSupported  = false;
+    bool m_capturePending = false;
+    int  m_captureFrameSkip = 0;
 
-    quint32 m_focusPosition  = 0;
-    quint32 m_focusMin       = 0;
-    quint32 m_focusMax       = 0;
-    bool    m_focusRangeValid = false;
-    bool    m_focusDragging  = false;
-
+    quint32 m_focusPosition = 0;
+    quint32 m_focusMin = 0;
+    quint32 m_focusMax = 0;
+    bool m_focusRangeValid = false;
+    bool m_focusDragging = false;
+    bool m_lvWasActiveBeforeCapture = false;
     QVariantList m_isoValues;
     QVariantList m_shutterValues;
     QVariantList m_exposureValues;
@@ -166,13 +179,13 @@ private:
     QVariantList m_imageSizeValues;
     QVariantList m_imageQualValues;
 
-    quint64 m_currentISO        = 0;
-    quint64 m_currentShutter    = 0;
-    quint64 m_currentExposure   = 0;
-    quint64 m_currentSharpness  = 0;
+    quint64 m_currentISO = 0;
+    quint64 m_currentShutter = 0;
+    quint64 m_currentExposure = 0;
+    quint64 m_currentSharpness = 0;
     quint64 m_currentBrightness = 0;
-    quint64 m_currentImageSize  = 0;
-    quint64 m_currentImageQual  = 0;
+    quint64 m_currentImageSize = 0;
+    quint64 m_currentImageQual = 0;
 
     QString m_exifModel;
     QString m_exifLens;
