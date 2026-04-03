@@ -10,8 +10,7 @@ qt_add_executable(SonyCameraApp
     main.cpp
     sonycamera.cpp
     liveviewprovider.h
-    sonycamera.h
-)
+    sonycamera.h)
 
 qt_add_qml_module(SonyCameraApp
     URI SonyPhotoEditor

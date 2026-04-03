@@ -10,7 +10,7 @@ ApplicationWindow {
     height: 760
     title: "Sony Photo Editor"
 
-    property bool openingForMain: false
+
     property int  imageRotation: 0
 
     property int  lvFrameSeq: 0
@@ -241,7 +241,7 @@ ApplicationWindow {
 
                     Button {
                         text: "Open Image"; implicitWidth: 118; implicitHeight: 34
-                        onClicked: { openingForMain = true; fileDialog.open() }
+                        onClicked: { fileDialog.open() }
                     }
 
                     Button {
@@ -680,16 +680,6 @@ ApplicationWindow {
                             }
 
                             SettingRow {
-                                label: "Brightness"
-                                currentText: sonyCamera.connected ? sonyCamera.formatBrightness(sonyCamera.currentBrightness) : "—"
-                                model: sonyCamera.brightnessValues
-                                currentValue: sonyCamera.currentBrightness
-                                enabled_: sonyCamera.connected
-                                formatFn: function(v) { return sonyCamera.formatBrightness(v) }
-                                onValueSelected: function(v) { sonyCamera.setBrightness(v) }
-                            }
-
-                            SettingRow {
                                 label: "Img Size"
                                 currentText: sonyCamera.connected ? sonyCamera.formatImageSize(sonyCamera.currentImageSize) : "—"
                                 model: sonyCamera.imageSizeValues
@@ -700,13 +690,13 @@ ApplicationWindow {
                             }
 
                             SettingRow {
-                                label: "Img Qual"
-                                currentText: sonyCamera.connected ? sonyCamera.formatImageQual(sonyCamera.currentImageQual) : "—"
-                                model: sonyCamera.imageQualValues
-                                currentValue: sonyCamera.currentImageQual
-                                enabled_: sonyCamera.connected && sonyCamera.imageQualValues.length > 0
-                                formatFn: function(v) { return sonyCamera.formatImageQual(v) }
-                                onValueSelected: function(v) { sonyCamera.setImageQual(v) }
+                                label: "JPEG Qual"
+                                currentText: sonyCamera.connected ? sonyCamera.formatJpegQual(sonyCamera.currentJpegQual) : "—"
+                                model: sonyCamera.jpegQualValues
+                                currentValue: sonyCamera.currentJpegQual
+                                enabled_: sonyCamera.connected && sonyCamera.jpegQualValues.length > 0
+                                formatFn: function(v) { return sonyCamera.formatJpegQual(v) }
+                                onValueSelected: function(v) { sonyCamera.setJpegQual(v) }
                             }
 
                             Rectangle {
@@ -1036,7 +1026,7 @@ ApplicationWindow {
                 }
                 MouseArea {
                     anchors.fill: parent; hoverEnabled: true
-                    onClicked: { openingForMain = false; fileDialog.open() }
+                    onClicked: { fileDialog.open() }
                     onEntered: addBtn.color = "#3E3E3E"; onExited: addBtn.color = "#2E2E2E"
                 }
             }

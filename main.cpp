@@ -18,13 +18,7 @@ int main(int argc, char *argv[])
                          lvProvider->updateFrame(frame);
                      });
 
-    QObject::connect(&camera, &SonyCamera::postViewFrameReady,
-                     [lvProvider](const QImage& frame) {
-                         lvProvider->updateFrame(frame);
-                     });
-
     QQmlApplicationEngine engine;
-
 
     engine.addImageProvider("liveview", lvProvider);
 

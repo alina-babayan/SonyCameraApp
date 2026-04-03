@@ -115,22 +115,25 @@ void SonyCamera::takePhoto()
         return;
     }
 
-    // FIX: Pause live view during capture to avoid USB bandwidth contention
-    // which causes disconnection especially with Extra Fine / large files.
+    if (m_propertyDebounceTimer) {
+        m_propertyDebounceTimer->stop();
+        m_propertyDebounceTimer->deleteLater();
+        m_propertyDebounceTimer = nullptr;
+        m_settingsFetchPending = false;
+    }
+
     m_lvWasActiveBeforeCapture = m_liveViewActive;
     if (m_liveViewActive) {
         m_lvTimer->stop();
-        qDebug() << "Live view paused for capture.";
+        m_liveViewActive = false;
+        emit liveViewActiveChanged(false);
     }
 
+    m_lvPolling = false;
     m_capturePending = true;
-    emit logMessage("Taking photo... Waiting for high-res file from camera.");
+    emit logMessage("Taking photo… waiting for full-res file (may take 10–30 s for RAW).");
 
-    // FIX: Use longer shutter-button hold for heavy quality modes (Extra Fine)
-    // to avoid triggering a disconnect from a too-short command burst.
-    bool isHeavyQuality = (m_currentImageQual == 4 ||
-                           m_currentImageQual == static_cast<quint64>(SCRSDK::CrImageQuality_ExFine));
-    int holdMs = isHeavyQuality ? 300 : 120;
+    int holdMs = 800;
 
     SCRSDK::CrDeviceHandle h = cameraHandle;
     QThreadPool::globalInstance()->start([h, holdMs]() {
@@ -139,17 +142,25 @@ void SonyCamera::takePhoto()
         SCRSDK::SendCommand(h, SCRSDK::CrCommandId_Release, SCRSDK::CrCommandParam_Up);
     });
 
-    QTimer::singleShot(20000, this, [this]() {
+    QTimer::singleShot(9000, this, [this]() {
         if (m_capturePending) {
             m_capturePending = false;
-            // Resume live view on timeout too
-            if (m_lvWasActiveBeforeCapture && m_liveViewActive == false && m_connected) {
-                m_liveViewActive = true;
-                emit liveViewActiveChanged(true);
-                m_lvTimer->start();
-                qDebug() << "Live view resumed after capture timeout.";
+            if (m_lvWasActiveBeforeCapture && !m_liveViewActive && m_connected) {
+                QTimer::singleShot(2000, this, [this]() {
+                    if (m_connected && !m_liveViewActive && !m_capturePending) {
+                        m_liveViewActive = true;
+                        emit liveViewActiveChanged(true);
+                        m_lvTimer->start();
+                    }
+                    m_lvWasActiveBeforeCapture = false;
+                });
+            } else {
+                m_lvWasActiveBeforeCapture = false;
             }
-            emit errorOccurred("Capture timeout. Please check 'PC Remote Settings' on camera.");
+            emit errorOccurred(
+                "Capture timeout (90 s). "
+                "Check camera: Menu → Network → PC Remote Settings → "
+                "Still Img. Save Dest. → 'PC+Memory Card'.");
         }
     });
 }
@@ -192,13 +203,19 @@ void SonyCamera::stopLiveView()
 
 void SonyCamera::pollLiveViewFrame()
 {
-    if (!m_connected || cameraHandle == 0 || !m_liveViewActive) return;
+    if (!m_connected || cameraHandle == 0 || !m_liveViewActive || m_capturePending)
+        return;
+
+    if (m_lvPolling) return;
+    m_lvPolling = true;
 
     SCRSDK::CrImageInfo imgInfo;
-    if (SCRSDK::GetLiveViewImageInfo(cameraHandle, &imgInfo) != SCRSDK::CrError_None) return;
+    if (SCRSDK::GetLiveViewImageInfo(cameraHandle, &imgInfo) != SCRSDK::CrError_None) {
+        m_lvPolling = false; return;
+    }
 
-    CrInt32u bufSize = imgInfo.GetBufferSize();
-    if (bufSize == 0) return;
+    auto bufSize = imgInfo.GetBufferSize();
+    if (bufSize == 0) { m_lvPolling = false; return; }
 
     std::vector<CrInt8u> buf(bufSize);
     SCRSDK::CrImageDataBlock dataBlock;
@@ -208,19 +225,18 @@ void SonyCamera::pollLiveViewFrame()
     if (SCRSDK::GetLiveViewImage(cameraHandle, &dataBlock) == SCRSDK::CrError_None) {
         QImage frame;
         const uchar* imageData = reinterpret_cast<const uchar*>(dataBlock.GetImageData());
-        if (frame.loadFromData(imageData, static_cast<int>(dataBlock.GetImageSize()), "JPEG")) {
+        if (frame.loadFromData(imageData, (int)dataBlock.GetImageSize(), "JPEG")) {
             emit liveViewFrameReady(frame);
         }
     }
+
+    m_lvPolling = false;
 }
 
 void SonyCamera::fetchFocusRange()
 {
     if (!m_connected || cameraHandle == 0) return;
 
-    // FIX: First check if FocusPositionSetting is actually supported by the camera
-    // in its current mode (MF required). Querying it in AF/Auto mode triggers
-    // warning 0x00020011 and causes the camera to disconnect (error 33287 / 0x8207).
     bool focusSettingSupported = false;
     bool focusCurrentSupported = false;
     {
@@ -239,13 +255,12 @@ void SonyCamera::fetchFocusRange()
     }
 
     if (!focusSettingSupported) {
-        qDebug() << "FocusPositionSetting not available in current camera mode (MF required). Skipping fetchFocusRange.";
+        qDebug() << "FocusPositionSetting not in property list — MF mode required. Skipping.";
         m_focusRangeValid = false;
         emit focusRangeReady();
         return;
     }
 
-    // Query FocusPositionSetting for range + current position
     {
         CrInt32u codeArr = static_cast<CrInt32u>(SCRSDK::CrDeviceProperty_FocusPositionSetting);
         SCRSDK::CrDeviceProperty* props = nullptr;
@@ -253,31 +268,35 @@ void SonyCamera::fetchFocusRange()
         SCRSDK::CrError err = SCRSDK::GetSelectDeviceProperties(
             cameraHandle, 1, &codeArr, &props, &numProps);
 
-        if (err == SCRSDK::CrError_None && props && numProps > 0) {
-            SCRSDK::CrDeviceProperty& p = props[0];
-            CrInt8u* rv   = p.GetValues();
-            CrInt32u rvSz = p.GetValueSize();
-
-            if (rv && rvSz >= 6) {
-                quint16 mn, mx, step;
-                memcpy(&mn,   rv + 0, 2);
-                memcpy(&mx,   rv + 2, 2);
-                memcpy(&step, rv + 4, 2);
-                if (mx > mn) {
-                    m_focusMin        = mn;
-                    m_focusMax        = mx;
-                    m_focusRangeValid = true;
-                    qDebug() << "Focus range:" << mn << "-" << mx << "step" << step;
-                }
-            }
-            // Current position comes from the same property — no need for a second query
-            m_focusPosition = static_cast<quint32>(p.GetCurrentValue() & 0xFFFF);
-            SCRSDK::ReleaseDeviceProperties(cameraHandle, props);
+        if (err != SCRSDK::CrError_None || !props || numProps == 0) {
+            qDebug() << "FocusPositionSetting query rejected (err=0x"
+                     << Qt::hex << static_cast<uint>(err) << ") — unavailable in this mode.";
+            if (props) SCRSDK::ReleaseDeviceProperties(cameraHandle, props);
+            m_focusRangeValid = false;
+            emit focusRangeReady();
+            return;
         }
+
+        SCRSDK::CrDeviceProperty& p = props[0];
+        CrInt8u* rv   = p.GetValues();
+        CrInt32u rvSz = p.GetValueSize();
+
+        if (rv && rvSz >= 6) {
+            quint16 mn, mx, step;
+            memcpy(&mn,   rv + 0, 2);
+            memcpy(&mx,   rv + 2, 2);
+            memcpy(&step, rv + 4, 2);
+            if (mx > mn) {
+                m_focusMin        = mn;
+                m_focusMax        = mx;
+                m_focusRangeValid = true;
+                qDebug() << "Focus range:" << mn << "-" << mx << "step" << step;
+            }
+        }
+        m_focusPosition = static_cast<quint32>(p.GetCurrentValue() & 0xFFFF);
+        SCRSDK::ReleaseDeviceProperties(cameraHandle, props);
     }
 
-    // FIX: Only query FocusPositionCurrentValue if the camera reports it as supported.
-    // Removed unconditional second query that also triggered warning 0x00020011.
     if (focusCurrentSupported) {
         CrInt32u codeArr = static_cast<CrInt32u>(SCRSDK::CrDeviceProperty_FocusPositionCurrentValue);
         SCRSDK::CrDeviceProperty* props = nullptr;
@@ -289,6 +308,8 @@ void SonyCamera::fetchFocusRange()
             quint32 live = static_cast<quint32>(props[0].GetCurrentValue() & 0xFFFF);
             if (live > 0) m_focusPosition = live;
             SCRSDK::ReleaseDeviceProperties(cameraHandle, props);
+        } else {
+            if (props) SCRSDK::ReleaseDeviceProperties(cameraHandle, props);
         }
     }
 
@@ -335,6 +356,7 @@ static quint64 readCurrentValue(SCRSDK::CrDeviceHandle handle,
     }
     return val;
 }
+
 void SonyCamera::fetchProperty(SCRSDK::CrDevicePropertyCode code,
                                QVariantList& outValues, quint64& outCurrent)
 {
@@ -346,8 +368,11 @@ void SonyCamera::fetchProperty(SCRSDK::CrDevicePropertyCode code,
     switch (code) {
     case SCRSDK::CrDeviceProperty_ExposureBiasCompensation:
     case SCRSDK::CrDeviceProperty_ImageSize:
-    case SCRSDK::CrDeviceProperty_WhiteBalance:           elemSize = 2; break;
+    case SCRSDK::CrDeviceProperty_WhiteBalance:
+    case SCRSDK::CrDeviceProperty_JpegQuality:             elemSize = 2; break;
     case SCRSDK::CrDeviceProperty_CreativeLook_Sharpness: elemSize = 1; break;
+    case SCRSDK::CrDeviceProperty_IsoSensitivity:
+    case SCRSDK::CrDeviceProperty_ShutterSpeed:           elemSize = 4; break;
     default: elemSize = 4; break;
     }
 
@@ -364,7 +389,6 @@ void SonyCamera::fetchProperty(SCRSDK::CrDevicePropertyCode code,
             if (!buf || sz == 0) return;
             for (CrInt32u i = 0; i < (sz / elemSize); i++) {
                 quint64 v = 0;
-                // Use a temporary buffer to ensure no out-of-bounds read
                 memcpy(&v, buf + (i * elemSize), elemSize);
                 outValues.append(v);
             }
@@ -378,49 +402,22 @@ void SonyCamera::fetchProperty(SCRSDK::CrDevicePropertyCode code,
         SCRSDK::ReleaseDeviceProperties(cameraHandle, props);
     }
 
-    // Hard fallback for Quality (0x101) if values are still 0
-    if (code == SCRSDK::CrDeviceProperty_StillImageQuality && outValues.isEmpty()) {
-        outValues << (quint64)0x01 << (quint64)0x02 << (quint64)0x03
-                  << (quint64)SCRSDK::CrFileType_Raw
-                  << (quint64)SCRSDK::CrFileType_RawJpeg;
-    }
 }
 
 void SonyCamera::fetchAllSettings()
 {
-    m_currentISO = readCurrentValue(cameraHandle, SCRSDK::CrDeviceProperty_IsoSensitivity);
-    m_isoValues.clear();
-    m_isoValues.append(QVariant::fromValue(quint64(0x00FFFFFF)));
-    static const quint32 isos[] = {
-        50,64,80,100,125,160,200,250,320,400,500,640,800,1000,1250,1600,
-        2000,2500,3200,4000,5000,6400,8000,10000,12800,16000,20000,
-        25600,32000,40000,51200,64000,80000,102400
-    };
-    for (auto iso : isos)
-        m_isoValues.append(QVariant::fromValue(quint64(iso)));
+    if (!m_connected || cameraHandle == 0 || m_capturePending) return;
 
-    // Shutter
-    m_currentShutter = readCurrentValue(cameraHandle, SCRSDK::CrDeviceProperty_ShutterSpeed);
-    m_shutterValues.clear();
-    m_shutterValues.append(QVariant::fromValue(quint64(0x00000000)));
-    static const quint32 dens[] = {
-        8000,6400,5000,4000,3200,2500,2000,1600,1250,1000,800,640,500,
-        400,320,250,200,160,125,100,80,60,50,40,30,25,20,15,13,10,8,6,5,4,3,2
-    };
-    for (auto d : dens)
-        m_shutterValues.append(QVariant::fromValue(quint64((quint32(1) << 16) | d)));
-    struct { quint32 n, d; } longs[] = {
-        {1,1},{13,10},{16,10},{2,1},{25,10},{3,1},{4,1},{5,1},
-        {6,1},{8,1},{10,1},{13,1},{15,1},{20,1},{25,1},{30,1}
-    };
-    for (auto& s : longs)
-        m_shutterValues.append(QVariant::fromValue(quint64((s.n << 16) | s.d)));
+    fetchProperty(SCRSDK::CrDeviceProperty_IsoSensitivity, m_isoValues, m_currentISO);
+    if (m_isoValues.isEmpty())
+        m_currentISO = readCurrentValue(cameraHandle, SCRSDK::CrDeviceProperty_IsoSensitivity);
+
+    fetchProperty(SCRSDK::CrDeviceProperty_ShutterSpeed, m_shutterValues, m_currentShutter);
+    if (m_shutterValues.isEmpty())
+        m_currentShutter = readCurrentValue(cameraHandle, SCRSDK::CrDeviceProperty_ShutterSpeed);
 
     fetchProperty(SCRSDK::CrDeviceProperty_ExposureBiasCompensation, m_exposureValues,   m_currentExposure);
     fetchProperty(SCRSDK::CrDeviceProperty_CreativeLook_Sharpness,   m_sharpnessValues,  m_currentSharpness);
-
-    m_brightnessValues.clear();
-    m_currentBrightness = 0;
 
     fetchProperty(SCRSDK::CrDeviceProperty_ImageSize, m_imageSizeValues, m_currentImageSize);
     if (m_imageSizeValues.size() < 2) {
@@ -429,12 +426,12 @@ void SonyCamera::fetchAllSettings()
         m_imageSizeValues.append(QVariant::fromValue(quint64(SCRSDK::CrImageSize_M)));
         m_imageSizeValues.append(QVariant::fromValue(quint64(SCRSDK::CrImageSize_S)));
     }
-    fetchProperty(SCRSDK::CrDeviceProperty_StillImageQuality, m_imageQualValues, m_currentImageQual);
-    if (m_imageQualValues.isEmpty()) {
-        m_imageQualValues.append(QVariant::fromValue(quint64(4)));
-        m_imageQualValues.append(QVariant::fromValue(quint64(2)));
-        m_imageQualValues.append(QVariant::fromValue(quint64(3)));
-        m_imageQualValues.append(QVariant::fromValue(quint64(1)));
+
+    fetchProperty(SCRSDK::CrDeviceProperty_JpegQuality, m_jpegQualValues, m_currentJpegQual);
+    if (m_jpegQualValues.isEmpty()) {
+        m_jpegQualValues.append(QVariant::fromValue(quint64(1)));
+        m_jpegQualValues.append(QVariant::fromValue(quint64(2)));
+        m_jpegQualValues.append(QVariant::fromValue(quint64(3)));
     }
 
     qDebug() << "Settings fetched:"
@@ -443,7 +440,7 @@ void SonyCamera::fetchAllSettings()
              << "EV:" << m_exposureValues.size()
              << "Sharpness:" << m_sharpnessValues.size()
              << "ImgSize:" << m_imageSizeValues.size()
-             << "ImgQual:" << m_imageQualValues.size();
+             << "JpegQual:" << m_jpegQualValues.size();
 
     emit settingsChanged();
 }
@@ -454,12 +451,10 @@ bool SonyCamera::setProperty(SCRSDK::CrDevicePropertyCode code, quint64 value)
 
     SCRSDK::CrDataType dtype;
     switch (code) {
+    case SCRSDK::CrDeviceProperty_JpegQuality:
+    case SCRSDK::CrDeviceProperty_ImageSize:
     case SCRSDK::CrDeviceProperty_ExposureBiasCompensation: dtype = SCRSDK::CrDataType_UInt16; break;
     case SCRSDK::CrDeviceProperty_CreativeLook_Sharpness:   dtype = SCRSDK::CrDataType_Int8;   break;
-    case SCRSDK::CrDeviceProperty_ShutterSpeed:             dtype = SCRSDK::CrDataType_UInt32; break;
-    case SCRSDK::CrDeviceProperty_IsoSensitivity:           dtype = SCRSDK::CrDataType_UInt32; break;
-    case SCRSDK::CrDeviceProperty_ImageSize:                dtype = SCRSDK::CrDataType_UInt16; break;
-    case SCRSDK::CrDeviceProperty_StillImageQuality:        dtype = SCRSDK::CrDataType_UInt32; break;
     default:                                                dtype = SCRSDK::CrDataType_UInt32; break;
     }
 
@@ -469,11 +464,7 @@ bool SonyCamera::setProperty(SCRSDK::CrDevicePropertyCode code, quint64 value)
     prop.SetValueType(dtype);
 
     SCRSDK::CrError err = SCRSDK::SetDeviceProperty(cameraHandle, &prop);
-    if (err != SCRSDK::CrError_None) {
-        qDebug() << "SetDeviceProperty failed for code" << code << "error:" << err;
-        return false;
-    }
-    return true;
+    return (err == SCRSDK::CrError_None);
 }
 
 void SonyCamera::setISO(quint64 value)
@@ -512,12 +503,6 @@ void SonyCamera::setSharpness(quint64 value)
     }
 }
 
-void SonyCamera::setBrightness(quint64 value)
-{
-    Q_UNUSED(value);
-    emit errorOccurred("Brightness control not supported in this SDK version.");
-}
-
 QString SonyCamera::formatISO(quint64 raw) const
 {
     quint32 isoVal = static_cast<qint32>(raw & 0x00FFFFFF);
@@ -549,12 +534,6 @@ QString SonyCamera::formatExposure(quint64 raw) const
     double ev = ev1000 / 1000.0;
     if (ev >= 0) return QString("+%1 EV").arg(ev, 0, 'f', 1);
     return QString("%1 EV").arg(ev, 0, 'f', 1);
-}
-
-QString SonyCamera::formatBrightness(quint64 raw) const
-{
-    Q_UNUSED(raw);
-    return "—";
 }
 
 void SonyCamera::fetchExifInfo()
@@ -686,48 +665,51 @@ void SonyCamera::fetchExifInfo()
 
 void SonyCamera::setupSaveInfo()
 {
-    SCRSDK::CrError err = SCRSDK::SetSaveInfo(
-        cameraHandle,
-        const_cast<CrChar*>(m_savePathLinux.c_str()),
-        const_cast<CrChar*>("IMG"), 0);
+    struct SaveVariant { const char* prefix; CrInt32u mode; };
+    static const SaveVariant variants[] = {
+                                           { "IMG", 2 },
+                                           { "IMG", 1 },
+                                           { "",    2 },
+                                           { "",    1 },
+                                           { nullptr, 2 },
+                                           { nullptr, 1 },
+                                           };
 
-    if (err != SCRSDK::CrError_None)
+    SCRSDK::CrError err = SCRSDK::CrError_Generic;
+    for (const auto& v : variants) {
         err = SCRSDK::SetSaveInfo(
             cameraHandle,
             const_cast<CrChar*>(m_savePathLinux.c_str()),
-            const_cast<CrChar*>(""), 1);
-
-    if (err != SCRSDK::CrError_None)
-        err = SCRSDK::SetSaveInfo(
-            cameraHandle,
-            const_cast<CrChar*>(m_savePathLinux.c_str()),
-            nullptr, 0);
-
-    if (err == SCRSDK::CrError_None) {
-        m_saveSupported = true;
-        emit logMessage("Full-res download enabled → " + m_savePath);
-    } else {
-        m_saveSupported = false;
-        qDebug() << "SetSaveInfo ALL variants failed. Last error: 0x" << Qt::hex << err;
-        emit logMessage(QString(
-                            "⚠ SetSaveInfo failed (0x%1). "
-                            "On camera: Menu → PC Remote Settings → Still Img. Save Dest. → 'PC Only'. "
-                            "Until then, photos are captured from live-view (low resolution).")
-                            .arg(static_cast<uint>(err), 0, 16));
-
+            const_cast<CrChar*>(v.prefix),
+            v.mode);
+        if (err == SCRSDK::CrError_None) break;
+        qDebug() << "SetSaveInfo prefix=" << (v.prefix ? v.prefix : "null")
+                 << "mode=" << v.mode << "failed: 0x" << Qt::hex << static_cast<uint>(err);
     }
 
-    SCRSDK::SetDeviceSetting(cameraHandle, SCRSDK::Setting_Key_EnableLiveView, SCRSDK::CrDeviceSetting_Enable);
+    if (err == SCRSDK::CrError_None) {
+        emit logMessage("✓ Full-res PC download enabled → " + m_savePath);
+    } else {
+        qDebug() << "SetSaveInfo ALL variants failed. Last error: 0x"
+                 << Qt::hex << static_cast<uint>(err);
+        emit logMessage(QString(
+                            "⚠ SetSaveInfo failed (0x%1). "
+                            "On camera: Menu → Network → PC Remote Settings → "
+                            "Still Img. Save Dest. → set to 'PC+Memory Card' or 'PC Only'.")
+                            .arg(static_cast<uint>(err), 0, 16));
+    }
 
-    QTimer::singleShot(1500, this, [this]() {
-        if(m_connected) fetchAllSettings();
-    });
+    SCRSDK::SetDeviceSetting(cameraHandle,
+                             SCRSDK::Setting_Key_EnableLiveView,
+                             SCRSDK::CrDeviceSetting_Enable);
 
-    QTimer::singleShot(2500, this, [this]() {
-        if(m_connected) fetchFocusRange();
+    QTimer::singleShot(800, this, [this]() {
+        if (!m_connected) return;
+        fetchAllSettings();
+        QTimer::singleShot(600, this, [this]() {
+            if (m_connected) fetchFocusRange();
+        });
     });
-    QTimer::singleShot(500,  this, [this]() { fetchAllSettings(); });
-    QTimer::singleShot(2000, this, [this]() { fetchFocusRange(); });
 }
 
 void SonyCamera::OnConnected(SCRSDK::DeviceConnectionVersioin version)
@@ -755,6 +737,7 @@ void SonyCamera::OnDisconnected(CrInt32u error)
         cameraHandle = 0;
         m_capturePending = false;
         m_lvWasActiveBeforeCapture = false;
+        m_warnedContentsTransfer = false;
         emit connectingChanged(false);
         emit connectionChanged(false);
     }, Qt::QueuedConnection);
@@ -772,7 +755,7 @@ void SonyCamera::OnPropertyChanged()
         }
         m_propertyDebounceTimer = new QTimer(this);
         m_propertyDebounceTimer->setSingleShot(true);
-        m_propertyDebounceTimer->setInterval(2000);
+        m_propertyDebounceTimer->setInterval(4000);
         connect(m_propertyDebounceTimer, &QTimer::timeout, this, [this]() {
             m_propertyDebounceTimer = nullptr;
             m_settingsFetchPending  = false;
@@ -783,68 +766,104 @@ void SonyCamera::OnPropertyChanged()
     }, Qt::QueuedConnection);
 }
 
-void SonyCamera::OnLvPropertyChanged()
-{
-}
+void SonyCamera::OnLvPropertyChanged() {}
 
 void SonyCamera::OnCompleteDownload(CrChar* filename, CrInt32u type)
 {
-    qDebug() << "OnCompleteDownload called, type:" << type
-             << "filename:" << (filename ? QString::fromLocal8Bit(filename) : "null");
-
-    if (!filename) {
-        QMetaObject::invokeMethod(this, [this]() {
-            emit errorOccurred("Download callback: filename is null.");
-        }, Qt::QueuedConnection);
+    if (!filename) return;
+    if (type == 0x0001) {
+        qDebug() << "OnCompleteDownload: preview received, waiting for full-res...";
         return;
     }
 
-    QString localPath = QString::fromLocal8Bit(filename);
-    bool isPreview = (type == 0x0001);
-    qDebug() << (isPreview ? "Preview" : "Full-res") << "downloaded type=0x"
-             << Qt::hex << type << localPath;
+    QString path = QString::fromLocal8Bit(filename);
+    qDebug() << "OnCompleteDownload: full-res type=0x"
+             << Qt::hex << type << path;
 
-    if (isPreview) return;
-
-    QMetaObject::invokeMethod(this, [this]() {
+    QMetaObject::invokeMethod(this, [this, path]() {
         m_capturePending = false;
 
-        // FIX: Resume live view now that the full-res file has been transferred.
-        if (m_lvWasActiveBeforeCapture && !m_liveViewActive && m_connected) {
-            m_liveViewActive = true;
-            emit liveViewActiveChanged(true);
-            m_lvTimer->start();
-            qDebug() << "Live view resumed after capture download.";
-        }
-        m_lvWasActiveBeforeCapture = false;
-    }, Qt::QueuedConnection);
+        struct PollState {
+            QString  path;
+            int      attempts = 0;
+            qint64   lastSize = -1;
+            int      stable   = 0;
+        };
+        auto* state = new PollState{ path };
 
-    struct PollState { QString path; int attempts; };
-    auto* state = new PollState{ localPath, 0 };
-
-    QMetaObject::invokeMethod(this, [this, state]() {
         auto* timer = new QTimer(this);
-        timer->setInterval(100);
+        timer->setInterval(500);
+
         connect(timer, &QTimer::timeout, this, [this, state, timer]() {
             state->attempts++;
-            if (QFileInfo::exists(state->path)) {
-                qint64 sz = QFileInfo(state->path).size();
-                if (sz > 0) {
-                    emit logMessage(QString("Photo saved (%1 MB): ").arg(sz/1024.0/1024.0, 0,'f',1) + state->path);
-                    emit photoTaken(state->path);
-                    timer->stop(); timer->deleteLater(); delete state;
+            QFileInfo fi(state->path);
+
+            if (fi.exists()) {
+                qint64 sz = fi.size();
+                if (sz > 0 && sz == state->lastSize) {
+                    if (++state->stable >= 3) {
+                        qDebug() << "File stable at"
+                                 << sz / 1024.0 / 1024.0 << "MB:" << state->path;
+                        emit logMessage(
+                            QString("✓ Photo saved (%1 MB): ")
+                                .arg(sz / 1024.0 / 1024.0, 0, 'f', 1)
+                            + state->path);
+                        emit photoTaken(state->path);
+
+                        if (m_lvWasActiveBeforeCapture && m_connected) {
+                            QTimer::singleShot(1500, this, [this]() {
+                                if (m_connected && !m_capturePending)
+                                    startLiveView();
+                            });
+                        }
+                        m_lvWasActiveBeforeCapture = false;
+
+                        timer->stop(); timer->deleteLater(); delete state;
+                        return;
+                    }
+                } else {
+                    state->stable = 0;
                 }
-            } else if (state->attempts >= 60) {
-                emit errorOccurred("Photo file not found after download: " + state->path);
+                state->lastSize = sz;
+            }
+
+            if (state->attempts >= 120) {
+                if (state->lastSize > 0) {
+                    emit logMessage(
+                        QString("⚠ Photo may be incomplete (%1 MB): ")
+                            .arg(state->lastSize / 1024.0 / 1024.0, 0, 'f', 1)
+                        + state->path);
+                    emit photoTaken(state->path);
+                } else {
+                    emit errorOccurred("File not found after download: " + state->path);
+                }
+                if (m_lvWasActiveBeforeCapture && m_connected) {
+                    QTimer::singleShot(1500, this, [this]() {
+                        if (m_connected && !m_capturePending) startLiveView();
+                    });
+                }
+                m_lvWasActiveBeforeCapture = false;
                 timer->stop(); timer->deleteLater(); delete state;
             }
         });
+
         timer->start();
     }, Qt::QueuedConnection);
 }
 
 void SonyCamera::OnWarning(CrInt32u w)
-{ qDebug() << "Warning:" << QString("0x%1").arg(w, 8, 16, QChar('0')); }
+{
+    qDebug() << "Warning:" << QString("0x%1").arg(w, 8, 16, QChar('0'));
+    if (w == 0x00020011 && !m_warnedContentsTransfer) {
+        m_warnedContentsTransfer = true;
+        QMetaObject::invokeMethod(this, [this]() {
+            emit logMessage(
+                "⚠ Warning 0x00020011: Camera cannot transfer full-res file. "
+                "On camera: Menu → Network → PC Remote Settings → "
+                "Still Img. Save Dest. → set to 'PC+Memory Card'.");
+        }, Qt::QueuedConnection);
+    }
+}
 
 void SonyCamera::OnWarningExt(CrInt32u w, CrInt32, CrInt32, CrInt32)
 { qDebug() << "Warning ext:" << w; }
@@ -888,20 +907,28 @@ void SonyCamera::setImageSize(quint64 value)
     emit settingsChanged();
     emit logMessage("Image Size → " + formatImageSize(value));
 }
+QString SonyCamera::formatJpegQual(quint64 raw) const
+{
+    switch (static_cast<quint16>(raw & 0xFFFF)) {
+    case 1: return "light";
+    case 2: return "Fine";
+    case 3: return "Standard";
+    default: return raw > 0 ? QString("Extra fine").arg(raw, 0, 16) : "—";
+    }
+}
 
-void SonyCamera::setImageQual(quint64 value)
+void SonyCamera::setJpegQual(quint64 value)
 {
     if (!m_connected || cameraHandle == 0) return;
 
-    qDebug() << "Setting Quality to:" << formatImageQual(value) << " (Value:" << value << ")";
-    if (!setProperty(SCRSDK::CrDeviceProperty_StillImageQuality, value)) {
-        emit errorOccurred("Failed to set Quality. Camera might not support this mode in current Dial position.");
+    if (!setProperty(SCRSDK::CrDeviceProperty_JpegQuality, value & 0xFFFF)) {
+        emit errorOccurred("Failed to set JPEG Quality.");
         return;
     }
 
-    m_currentImageQual = value;
+    m_currentJpegQual = value;
     emit settingsChanged();
-    emit logMessage("Quality changed to → " + formatImageQual(value));
+    emit logMessage("JPEG Quality → " + formatJpegQual(value));
 }
 
 QString SonyCamera::formatImageSize(quint64 raw) const
@@ -915,17 +942,3 @@ QString SonyCamera::formatImageSize(quint64 raw) const
     }
 }
 
-QString SonyCamera::formatImageQual(quint64 raw) const
-{
-    uint32_t val = static_cast<uint32_t>(raw);
-
-    // Sony standard mapping for Quality
-    if (val == 0x01) return "Extra Fine";
-    if (val == 0x02) return "Fine";
-    if (val == 0x03) return "Standard";
-
-    if (val == SCRSDK::CrFileType_Raw)     return "RAW";
-    if (val == SCRSDK::CrFileType_RawJpeg) return "RAW+JPEG";
-
-    return raw > 0 ? QString("0x%1").arg(raw, 0, 16) : "—";
-}
